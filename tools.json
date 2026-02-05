@@ -1,0 +1,140 @@
+{
+  "tools": [
+    {
+      "name": "ray.list_entries",
+      "description": "List stored Ray entries with optional filters and pagination.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "projectName": {
+            "type": "string",
+            "description": "Filter by project name/source"
+          },
+          "hostname": {
+            "type": "string",
+            "description": "Filter by hostname/source"
+          },
+          "screen": {
+            "type": "string",
+            "description": "Filter by screen name"
+          },
+          "types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Filter by payload types"
+          },
+          "query": {
+            "type": "string",
+            "description": "Search query applied to the indexed search text"
+          },
+          "limit": {
+            "type": "number",
+            "default": 100
+          },
+          "offset": {
+            "type": "number",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "ray.get_entry",
+      "description": "Get a single entry by UUID.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "uuid": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "uuid"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "ray.list_screens",
+      "description": "List screens and summary counts. Optionally filter by source.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "projectName": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "ray.emit",
+      "description": "Emit a Ray action/log. Use `type` to select the payload type and put type-specific fields under `data`.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "log",
+              "custom",
+              "json",
+              "json_string",
+              "table",
+              "html",
+              "markdown",
+              "mermaid",
+              "separator",
+              "notification",
+              "new_screen",
+              "clear_screen",
+              "clear_all",
+              "confetti",
+              "show_app",
+              "hide_app"
+            ]
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "projectName": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "llmName": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    }
+  ]
+}

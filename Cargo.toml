@@ -1,0 +1,57 @@
+[package]
+name = "raymon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.70"
+description = "Stateful MCP server and TUI for Ray-style logs"
+readme = "README.md"
+homepage = ""
+repository = ""
+keywords = ["mcp", "tui", "logging", "observability", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+arboard = "3"
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+itoa = "1.0.17"
+memchr = "2.7.6"
+ratatui = "0.28"
+rapidfuzz = "0.5"
+rayon = { version = "1", optional = true }
+regex = "1"
+rmcp = { version = "0.14", features = ["server", "macros", "transport-streamable-http-server", "transport-streamable-http-server-session", "tower"] }
+schemars = { version = "1", features = ["derive", "chrono04"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shlex = "1"
+smallvec = "1.15.1"
+smol_str = "0.3.5"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+divan = "0.1"
+rstest = "0.23"
+
+[features]
+default = ["rayon"]
+
+[[bench]]
+name = "raymon_perf"
+harness = false
+
+[[bench]]
+name = "raymon_tui_perf"
+harness = false
+
+[[bench]]
+name = "raymon_storage_perf"
+harness = false
