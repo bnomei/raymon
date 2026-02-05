@@ -31,6 +31,47 @@ Headless mode (no TUI):
 RAYMON_NO_TUI=1 cargo run
 ```
 
+Demo mode (self-generates events):
+
+```bash
+cargo run -- --demo
+```
+
+### MCP Client Setup (Agents)
+
+Raymon exposes an MCP **Streamable HTTP** endpoint at `http://127.0.0.1:7777/mcp` by default.
+
+1) Start Raymon (keep it running):
+```bash
+cargo run
+```
+
+2) Add it to your MCP client:
+```bash
+# Codex CLI
+codex mcp add raymon --url http://127.0.0.1:7777/mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "raymon": {
+      "url": "http://127.0.0.1:7777/mcp"
+    }
+  }
+}
+```
+
+3) Optional: require + send auth (recommended for remote binds)
+```bash
+export RAYMON_AUTH_TOKEN="change-me"
+RAYMON_AUTH_TOKEN="$RAYMON_AUTH_TOKEN" cargo run
+
+codex mcp add raymon --url http://127.0.0.1:7777/mcp --bearer-token-env-var RAYMON_AUTH_TOKEN
+```
+
+If you change `RAYMON_HOST` / `RAYMON_PORT`, update the MCP URL accordingly.
+
 ### Sending Logs
 
 If you want a Rust-native way to send Ray-compatible payloads, use the companion library
@@ -173,14 +214,25 @@ Shutdown signal (non-tool):
 ## TUI
 
 The TUI is intentionally “editor-like” (vim/helix-ish):
-- `Space` opens the Space modal (help/pickers).
-- `Space q` quits (and shuts down the HTTP/MCP server).
-- `/` searches, `Space r` opens regex search.
+- `?` opens keybindings/help.
+- `q` quits (and shuts down the HTTP/MCP server).
+- `Space` opens the pickers/filters modal.
+- `/` searches (fuzzy, message + file; path-like queries are literal), `r` opens regex search (message + file).
+- `:` searches inside detail (jq).
+- `J/K` or `PageUp/PageDown` scrolls the detail pane.
 - `p` pauses/resumes live updates.
-- `k` clears the current screen (“archive logs”).
+- `x` archives the current view (writes a new archive file).
+- `d` (in the Archives pane) deletes the selected archive (confirm required; live cannot be deleted).
 - `y` yanks the selected list entry, `Y` yanks the detail pane.
+- `z` toggles JSON expanded/collapsed (default: expanded), `Z` toggles raw JSON.
+- `u` resets search + filters (screens/types/colors).
 - `Ctrl+y` pastes the yank register into inputs.
+- `1` toggles color dot, `2` timestamp, `3` type label, `4` file, `5` message, `6` uuid (short).
 - `o` opens the origin in your IDE (see `RAYMON_IDE`), `e` opens the detail in `$EDITOR` via a temp file.
+- In the Archives pane, `Enter` loads the selected archive; the green `‣` row returns to live (`◼` = active archive, `◻` = inactive).
+
+Color strategy: Raymon sticks to the terminal’s ANSI palette (16 colors + text attributes like bold/dim/reverse),
+so it inherits your terminal theme (light/dark, base16, etc) without implementing full app theming.
 
 ## Configuration
 
@@ -196,6 +248,8 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_IDE` | `code` | IDE command used for “open origin” (for VS Code line jumps, use `code --goto`). |
 | `RAYMON_EDITOR` | `VISUAL`/`EDITOR`/`vim` | Editor command used for “open in editor”. |
 | `RAYMON_JQ` | `jq` | `jq` command used for detail search. |
+| `RAYMON_TUI_PALETTE` | unset | Optional TUI palette override: 18 comma-separated colors `fg,bg,black,red,green,yellow,blue,magenta,cyan,white,bright_black,bright_red,bright_green,bright_yellow,bright_blue,bright_magenta,bright_cyan,bright_white` as `#RRGGBB` (also accepts `rgb:RRRR/GGGG/BBBB`). |
+| `RAYMON_PALETTE` | unset | Alias for `RAYMON_TUI_PALETTE`. |
 | `RAYMON_MAX_BODY_BYTES` | `1048576` | Max size (bytes) for HTTP POST bodies. |
 | `RAYMON_MAX_QUERY_LEN` | `265` | Max length (bytes) for search/command/picker queries. |
 | `RAYMON_JQ_TIMEOUT_MS` | `10000` | `jq` timeout in milliseconds. |

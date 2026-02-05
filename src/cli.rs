@@ -2,47 +2,60 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     hash::{Hash, Hasher},
-    io,
+    io::{self, Write},
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
     },
     time::Duration,
 };
 
+use crate::raymon_core::{
+    Entry as CoreEntry, Event as CoreEvent, EventBus as CoreEventBusTrait, Filters, RayEnvelope,
+    RayMeta, RayOrigin, RayPayload, Screen, StateStore as CoreStateStoreTrait,
+};
+use crate::colors::canonical_color_name;
+use crate::raymon_ingest::Ingestor;
+use crate::raymon_mcp::{RaymonMcp, RaymonMcpService};
+use crate::raymon_storage::{
+    EntryInput,
+    EntryPayload as StoragePayload,
+    Storage as RaymonStorage,
+    StoredEntry,
+    StoredPayload,
+    ENTRIES_FILE,
+};
+use crate::raymon_tui::{Action, LogEntry, Tui, TuiConfig, TuiPalette};
 use axum::{
     body::{Body, Bytes},
-    extract::State,
     extract::DefaultBodyLimit,
+    extract::Request as AxumRequest,
+    extract::State,
     http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     response::{IntoResponse, Json},
     routing::post,
-    middleware::{self, Next},
-    extract::Request as AxumRequest,
-    response::Response,
     Router,
 };
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
-use crate::raymon_core::{
-    Entry as CoreEntry, Event as CoreEvent, EventBus as CoreEventBusTrait, Filters, Screen,
-    StateStore as CoreStateStoreTrait,
-};
-use crate::raymon_ingest::Ingestor;
-use crate::raymon_mcp::{RaymonMcp, RaymonMcpService};
-use crate::raymon_storage::{EntryInput, EntryPayload as StoragePayload, Storage as RaymonStorage};
-use crate::raymon_tui::{Action, LogEntry, Tui, TuiConfig};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use serde::Deserialize;
-use tokio::sync::broadcast;
-use tracing::{info, warn};
+use serde_json::Value;
+use tokio::{
+    sync::{broadcast, watch},
+    time,
+};
 use tower::ServiceExt;
+use tracing::{info, warn};
+use uuid::Uuid;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 7777;
@@ -60,6 +73,7 @@ enum UiEvent {
     Log(LogEntry),
     ClearScreen(String),
     ClearAll,
+    Quit,
 }
 
 #[derive(Parser, Debug)]
@@ -81,6 +95,8 @@ struct Cli {
     tui: bool,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     no_tui: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    demo: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,9 +176,7 @@ impl Config {
     fn from_partial(partial: PartialConfig) -> Self {
         Self {
             enabled: partial.enabled.unwrap_or(true),
-            host: partial
-                .host
-                .unwrap_or_else(|| DEFAULT_HOST.to_string()),
+            host: partial.host.unwrap_or_else(|| DEFAULT_HOST.to_string()),
             port: partial.port.unwrap_or(DEFAULT_PORT),
             ide: partial.ide,
             editor: partial.editor,
@@ -224,15 +238,9 @@ impl FileConfig {
 #[derive(Debug, thiserror::Error)]
 enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
-    ReadFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    ReadFile { path: PathBuf, source: std::io::Error },
     #[error("failed to parse config file {path}: {source}")]
-    ParseFile {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
+    ParseFile { path: PathBuf, source: serde_json::Error },
     #[error("config file not found: {path}")]
     MissingConfig { path: PathBuf },
     #[error("invalid value for {name}: {value}")]
@@ -257,13 +265,9 @@ type IngestorHandle = Ingestor<IngestState, StorageHandle, IngestBus, fn() -> u6
 impl AppState {
     fn ingestor(&self) -> IngestorHandle {
         Ingestor::new(
-            IngestState {
-                core: self.core.clone(),
-            },
+            IngestState { core: self.core.clone() },
             self.storage.clone(),
-            IngestBus {
-                bus: self.bus.clone(),
-            },
+            IngestBus { bus: self.bus.clone() },
             crate::raymon_ingest::now_millis,
         )
     }
@@ -296,10 +300,8 @@ impl CoreState {
 
     fn update(&self, entry: CoreEntry) -> Result<(), StateError> {
         let mut inner = self.inner.write().map_err(|_| StateError::Poisoned)?;
-        if let Some(existing) = inner
-            .entries
-            .iter_mut()
-            .find(|existing| existing.uuid == entry.uuid)
+        if let Some(existing) =
+            inner.entries.iter_mut().find(|existing| existing.uuid == entry.uuid)
         {
             *existing = entry;
         } else {
@@ -310,11 +312,7 @@ impl CoreState {
 
     fn get(&self, uuid: &str) -> Result<Option<CoreEntry>, StateError> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
-        Ok(inner
-            .entries
-            .iter()
-            .find(|entry| entry.uuid == uuid)
-            .cloned())
+        Ok(inner.entries.iter().find(|entry| entry.uuid == uuid).cloned())
     }
 
     fn list(&self, filters: &Filters) -> Result<Vec<CoreEntry>, StateError> {
@@ -412,20 +410,13 @@ struct StorageHandle {
 
 impl StorageHandle {
     fn new(storage: RaymonStorage) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(storage)),
-        }
+        Self { inner: Arc::new(Mutex::new(storage)) }
     }
 
     fn append_ingest_entry(&self, entry: &CoreEntry) -> Result<(), String> {
         let input = entry_to_storage_input(entry)?;
-        let mut storage = self
-            .inner
-            .lock()
-            .map_err(|_| "storage lock poisoned".to_string())?;
-        storage
-            .append_entry(input)
-            .map_err(|error| error.to_string())?;
+        let mut storage = self.inner.lock().map_err(|_| "storage lock poisoned".to_string())?;
+        storage.append_entry(input).map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -466,13 +457,119 @@ impl crate::raymon_ingest::EventBus for IngestBus {
     }
 }
 
-fn build_state(storage_root: &Path) -> Result<AppState, DynError> {
+fn restore_from_storage(
+    core: &CoreState,
+    storage: &RaymonStorage,
+    collect_logs: bool,
+) -> Result<Vec<LogEntry>, DynError> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let entries_path = storage.data_dir().join(ENTRIES_FILE);
+    let file = match File::open(&entries_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut reader = BufReader::new(file);
+    let mut offset = 0u64;
+    let mut buf = Vec::new();
+    let mut restored = 0usize;
+    let mut skipped = 0usize;
+    let mut logs = Vec::new();
+    let mut seen = HashSet::new();
+
+    loop {
+        buf.clear();
+        let bytes = reader.read_until(b'\n', &mut buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        let mut line_bytes = buf.as_slice();
+        if line_bytes.ends_with(b"\n") {
+            line_bytes = &line_bytes[..line_bytes.len() - 1];
+        }
+        if line_bytes.ends_with(b"\r") {
+            line_bytes = &line_bytes[..line_bytes.len() - 1];
+        }
+        if line_bytes.is_empty() {
+            offset += bytes as u64;
+            continue;
+        }
+
+        let stored: StoredEntry = match serde_json::from_slice(line_bytes) {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(?err, offset, "Skipping corrupt JSONL entry");
+                skipped += 1;
+                offset += bytes as u64;
+                continue;
+            }
+        };
+
+        let core_entry = match stored.payload {
+            StoredPayload::Text { text } => match serde_json::from_str::<CoreEntry>(&text) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!(?err, offset, "Skipping JSONL entry with invalid payload");
+                    skipped += 1;
+                    offset += bytes as u64;
+                    continue;
+                }
+            },
+            StoredPayload::Blob { .. } => {
+                warn!(offset, "Skipping JSONL entry with blob payload");
+                skipped += 1;
+                offset += bytes as u64;
+                continue;
+            }
+        };
+
+        let log_entry = collect_logs.then(|| log_entry_from_core(&core_entry));
+        let is_first = seen.insert(core_entry.uuid.clone());
+
+        if is_first {
+            core.insert(core_entry)
+                .map_err(|error| -> DynError { Box::new(error) })?;
+        } else {
+            core.update(core_entry)
+                .map_err(|error| -> DynError { Box::new(error) })?;
+        }
+
+        if let Some(log_entry) = log_entry {
+            logs.push(log_entry);
+        }
+
+        restored += 1;
+        offset += bytes as u64;
+    }
+
+    if restored > 0 || skipped > 0 {
+        info!(
+            restored,
+            skipped,
+            path = %entries_path.display(),
+            "restored entries from storage"
+        );
+    }
+
+    Ok(logs)
+}
+
+fn build_state(storage_root: &Path, collect_logs: bool) -> Result<(AppState, Vec<LogEntry>), DynError> {
     let storage = RaymonStorage::new(storage_root)?;
-    Ok(AppState {
-        core: CoreState::default(),
-        storage: StorageHandle::new(storage),
-        bus: CoreBus::new(),
-    })
+    let core = CoreState::default();
+    let logs = restore_from_storage(&core, &storage, collect_logs)?;
+    Ok((
+        AppState {
+            core,
+            storage: StorageHandle::new(storage),
+            bus: CoreBus::new(),
+        },
+        logs,
+    ))
 }
 
 fn entry_to_storage_input(entry: &CoreEntry) -> Result<EntryInput, String> {
@@ -500,11 +597,7 @@ fn entry_to_storage_input(entry: &CoreEntry) -> Result<EntryInput, String> {
 
 fn summarize_entry(entry: &CoreEntry, payload_text: &str) -> String {
     if let Some(payload) = entry.payloads.first() {
-        if let Some(message) = payload
-            .content
-            .get("message")
-            .and_then(|value| value.as_str())
-        {
+        if let Some(message) = payload.content.get("message").and_then(|value| value.as_str()) {
             return truncate(message, SUMMARY_LIMIT);
         }
     }
@@ -574,7 +667,12 @@ fn build_search_text(entry: &CoreEntry, payload_text: &str) -> SearchTextMetadat
         }
         push_token(&mut search_text, &mut is_first, &payload.r#type);
 
-        if let Some(color) = payload.content.get("color").and_then(|value| value.as_str()) {
+        if let Some(color) = payload
+            .content
+            .get("color")
+            .and_then(|value| value.as_str())
+            .and_then(canonical_color_name)
+        {
             if seen_colors.insert(color) {
                 colors.push(color.to_string());
             }
@@ -593,11 +691,7 @@ fn build_search_text(entry: &CoreEntry, payload_text: &str) -> SearchTextMetadat
     }
     push_token(&mut search_text, &mut is_first, payload_text);
 
-    SearchTextMetadata {
-        search_text,
-        types,
-        colors,
-    }
+    SearchTextMetadata { search_text, types, colors }
 }
 
 fn truncate(value: &str, max_len: usize) -> String {
@@ -614,27 +708,29 @@ fn log_id(uuid: &str) -> u64 {
 }
 
 fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
-    let fallback = entry
-        .payloads
-        .first()
-        .map(|payload| payload.r#type.as_str())
-        .unwrap_or("entry");
+    let fallback = entry.payloads.first().map(|payload| payload.r#type.as_str()).unwrap_or("entry");
     let message = entry
         .payloads
         .first()
         .and_then(|payload| payload.content.get("message"))
         .and_then(|value| value.as_str())
         .unwrap_or(fallback);
-    let detail = serde_json::to_string_pretty(entry).unwrap_or_else(|_| format!("{entry:?}"));
+    let detail_value = extract_entry_detail_value(entry);
+    let detail = match detail_value {
+        Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
+        None => {
+            let contents: Vec<&Value> =
+                entry.payloads.iter().map(|payload| &payload.content).collect();
+            match contents.as_slice() {
+                [only] => serde_json::to_string(only).unwrap_or_else(|_| only.to_string()),
+                _ => serde_json::to_string(&contents).unwrap_or_else(|_| format!("{entry:?}")),
+            }
+        }
+    };
     let (origin_file, origin_line) = entry
         .payloads
         .first()
-        .map(|payload| {
-            (
-                payload.origin.file.clone(),
-                payload.origin.line_number,
-            )
-        })
+        .map(|payload| (payload.origin.file.clone(), payload.origin.line_number))
         .unwrap_or((None, None));
     let origin = origin_file.as_deref().map(|file| {
         if let Some(line) = origin_line {
@@ -645,20 +741,19 @@ fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
     });
 
     let entry_type = entry.payloads.first().map(|payload| payload.r#type.clone());
-    let color = entry
-        .payloads
-        .iter()
-        .find_map(|payload| {
-            payload
-                .content
-                .get("color")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-        });
+    let color = entry.payloads.iter().find_map(|payload| {
+        payload
+            .content
+            .get("color")
+            .and_then(|value| value.as_str())
+            .and_then(canonical_color_name)
+            .map(|value| value.to_string())
+    });
     let screen = Some(entry.screen.as_str().to_string());
 
     LogEntry {
         id: log_id(&entry.uuid),
+        uuid: entry.uuid.clone(),
         message: truncate(message, SUMMARY_LIMIT),
         detail,
         origin,
@@ -669,6 +764,32 @@ fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
         color,
         screen,
     }
+}
+
+fn extract_entry_detail_value(entry: &CoreEntry) -> Option<Value> {
+    let mut values: Vec<Value> =
+        entry.payloads.iter().filter_map(|payload| payload.content.get("data").cloned()).collect();
+
+    if values.is_empty() {
+        return None;
+    }
+
+    if values.len() == 1 {
+        return values.pop();
+    }
+
+    let all_arrays = values.iter().all(|value| matches!(value, Value::Array(_)));
+    if all_arrays {
+        let mut flattened = Vec::new();
+        for value in values {
+            if let Value::Array(items) = value {
+                flattened.extend(items);
+            }
+        }
+        return Some(Value::Array(flattened));
+    }
+
+    Some(Value::Array(values))
 }
 
 fn cli_overrides(cli: &Cli) -> PartialConfig {
@@ -723,10 +844,7 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
     if let Some(value) = env.get("RAYMON_ALLOW_REMOTE") {
         partial.allow_remote = Some(parse_bool("RAYMON_ALLOW_REMOTE", value)?);
     }
-    if let Some(value) = env
-        .get("RAYMON_AUTH_TOKEN")
-        .or_else(|| env.get("RAYMON_TOKEN"))
-    {
+    if let Some(value) = env.get("RAYMON_AUTH_TOKEN").or_else(|| env.get("RAYMON_TOKEN")) {
         if !value.trim().is_empty() {
             partial.auth_token = Some(value.clone());
         }
@@ -743,55 +861,58 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
     Ok(partial)
 }
 
+fn tui_palette_override(env: &BTreeMap<String, String>) -> Result<Option<TuiPalette>, ConfigError> {
+    let (name, value) = match env.get("RAYMON_TUI_PALETTE") {
+        Some(value) => ("RAYMON_TUI_PALETTE", value),
+        None => match env.get("RAYMON_PALETTE") {
+            Some(value) => ("RAYMON_PALETTE", value),
+            None => return Ok(None),
+        },
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = TuiPalette::parse_csv(trimmed).map_err(|error| ConfigError::InvalidEnv {
+        name: name.to_string(),
+        value: format!("{trimmed} ({error})"),
+    })?;
+    Ok(Some(parsed))
+}
+
 fn parse_u16(name: &str, value: &str) -> Result<u16, ConfigError> {
     value
         .parse::<u16>()
-        .map_err(|_| ConfigError::InvalidEnv {
-            name: name.to_string(),
-            value: value.to_string(),
-        })
+        .map_err(|_| ConfigError::InvalidEnv { name: name.to_string(), value: value.to_string() })
 }
 
 fn parse_usize(name: &str, value: &str) -> Result<usize, ConfigError> {
     value
         .parse::<usize>()
-        .map_err(|_| ConfigError::InvalidEnv {
-            name: name.to_string(),
-            value: value.to_string(),
-        })
+        .map_err(|_| ConfigError::InvalidEnv { name: name.to_string(), value: value.to_string() })
 }
 
 fn parse_u64(name: &str, value: &str) -> Result<u64, ConfigError> {
     value
         .parse::<u64>()
-        .map_err(|_| ConfigError::InvalidEnv {
-            name: name.to_string(),
-            value: value.to_string(),
-        })
+        .map_err(|_| ConfigError::InvalidEnv { name: name.to_string(), value: value.to_string() })
 }
 
 fn parse_bool(name: &str, value: &str) -> Result<bool, ConfigError> {
     match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(ConfigError::InvalidEnv {
-            name: name.to_string(),
-            value: value.to_string(),
-        }),
+        _ => Err(ConfigError::InvalidEnv { name: name.to_string(), value: value.to_string() }),
     }
 }
 
 fn load_config_file(path: &Path) -> Result<PartialConfig, ConfigError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let parsed: FileConfig = serde_json::from_str(&contents).map_err(|source| {
-        ConfigError::ParseFile {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
+    let contents = std::fs::read_to_string(path)
+        .map_err(|source| ConfigError::ReadFile { path: path.to_path_buf(), source })?;
+    let parsed: FileConfig = serde_json::from_str(&contents)
+        .map_err(|source| ConfigError::ParseFile { path: path.to_path_buf(), source })?;
     Ok(parsed.into_partial())
 }
 
@@ -818,9 +939,7 @@ fn resolve_config(
 
     let config_path = if let Some(path) = &cli.config {
         if !path.is_file() {
-            return Err(ConfigError::MissingConfig {
-                path: path.clone(),
-            });
+            return Err(ConfigError::MissingConfig { path: path.clone() });
         }
         Some(path.clone())
     } else {
@@ -857,18 +976,12 @@ fn resolve_config(
 fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr, std::io::Error> {
     let mut addrs = (host, port).to_socket_addrs()?;
     addrs.next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "no bind addresses resolved",
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no bind addresses resolved")
     })
 }
 
 fn storage_root(cwd: &Path, config_path: Option<&PathBuf>) -> PathBuf {
-    config_path
-        .and_then(|path| path.parent())
-        .unwrap_or(cwd)
-        .to_path_buf()
+    config_path.and_then(|path| path.parent()).unwrap_or(cwd).to_path_buf()
 }
 
 async fn run_server(
@@ -906,15 +1019,24 @@ async fn run_server(
 async fn run_tui(
     config: TuiConfig,
     bus: CoreBus,
+    initial_logs: Vec<LogEntry>,
     mut shutdown: broadcast::Receiver<()>,
     shutdown_tx: broadcast::Sender<()>,
+    pause_tx: Option<watch::Sender<bool>>,
 ) -> Result<(), DynError> {
-    let mut event_rx = bus
-        .subscribe()
-        .map_err(|error| format!("event bus subscribe failed: {error}"))?;
+    let mut event_rx =
+        bus.subscribe().map_err(|error| format!("event bus subscribe failed: {error}"))?;
     let (log_tx, log_rx) = std::sync::mpsc::channel::<UiEvent>();
+    let log_tx_forward = log_tx.clone();
+    let log_tx_shutdown = log_tx.clone();
     let running = Arc::new(AtomicBool::new(true));
     let running_signal = running.clone();
+
+    for entry in initial_logs {
+        if log_tx.send(UiEvent::Log(entry)).is_err() {
+            break;
+        }
+    }
 
     let forward_handle = tokio::spawn(async move {
         loop {
@@ -931,7 +1053,7 @@ async fn run_tui(
                     };
 
                     if let Some(ui_event) = ui_event {
-                        if log_tx.send(ui_event).is_err() {
+                        if log_tx_forward.send(ui_event).is_err() {
                             break;
                         }
                     }
@@ -944,10 +1066,11 @@ async fn run_tui(
 
     let shutdown_handle = tokio::spawn(async move {
         let _ = shutdown.recv().await;
+        let _ = log_tx_shutdown.send(UiEvent::Quit);
         running_signal.store(false, Ordering::SeqCst);
     });
 
-    tokio::task::spawn_blocking(move || run_tui_loop(config, log_rx, running, shutdown_tx))
+    tokio::task::spawn_blocking(move || run_tui_loop(config, log_rx, running, shutdown_tx, pause_tx))
         .await??;
 
     forward_handle.abort();
@@ -961,6 +1084,7 @@ fn run_tui_loop(
     log_rx: std::sync::mpsc::Receiver<UiEvent>,
     running: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
+    pause_tx: Option<watch::Sender<bool>>,
 ) -> Result<(), DynError> {
     let _guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
@@ -977,7 +1101,16 @@ fn run_tui_loop(
                 UiEvent::Log(entry) => tui.push_log(entry),
                 UiEvent::ClearScreen(screen) => tui.clear_screen_for(Some(&screen)),
                 UiEvent::ClearAll => tui.clear_screen_for(None),
+                UiEvent::Quit => {
+                    let _ = shutdown_tx.send(());
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
             }
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            break;
         }
 
         terminal.draw(|frame| {
@@ -987,14 +1120,64 @@ fn run_tui_loop(
         if event::poll(Duration::from_millis(TUI_TICK_MS))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let was_paused = tui.state.paused;
                     let action = tui.handle_key(key);
+                    if let Some(pause_tx) = &pause_tx {
+                        let now_paused = tui.state.paused;
+                        if now_paused != was_paused {
+                            let _ = pause_tx.send(now_paused);
+                        }
+                    }
                     if action == Action::Quit {
                         let _ = shutdown_tx.send(());
                         running.store(false, Ordering::SeqCst);
                         break;
                     }
                     if action != Action::None {
-                        if let Err(error) = tui.perform_action(action) {
+                        if matches!(action, Action::OpenEditor | Action::OpenOrigin) {
+                            match TerminalSuspendGuard::new(&mut terminal) {
+                                Ok(_guard) => {
+                                    if let Err(error) = tui.perform_action(action) {
+                                        warn!(error = %error, "tui action failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(error = %error, "tui terminal suspend failed");
+                                    tui.state.detail_notice = Some(
+                                        "failed to suspend terminal for external command"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        } else if let Err(error) = tui.perform_action(action) {
+                            warn!(error = %error, "tui action failed");
+                        }
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let rect = Rect { x: 0, y: 0, width: size.width, height: size.height };
+                    let action = tui.handle_mouse(mouse, rect);
+                    if action == Action::Quit {
+                        let _ = shutdown_tx.send(());
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    if action != Action::None {
+                        if matches!(action, Action::OpenEditor | Action::OpenOrigin) {
+                            match TerminalSuspendGuard::new(&mut terminal) {
+                                Ok(_guard) => {
+                                    if let Err(error) = tui.perform_action(action) {
+                                        warn!(error = %error, "tui action failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(error = %error, "tui terminal suspend failed");
+                                    tui.state.detail_notice =
+                                        Some("failed to suspend terminal for external command".to_string());
+                                }
+                            }
+                        } else if let Err(error) = tui.perform_action(action) {
                             warn!(error = %error, "tui action failed");
                         }
                     }
@@ -1014,7 +1197,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self, DynError> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -1022,7 +1205,37 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    }
+}
+
+struct TerminalSuspendGuard<'a> {
+    terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl<'a> TerminalSuspendGuard<'a> {
+    fn new(terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<Self, DynError> {
+        terminal.show_cursor()?;
+        disable_raw_mode()?;
+        if let Err(error) = execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen) {
+            let _ = enable_raw_mode();
+            let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture);
+            let _ = terminal.hide_cursor();
+            let _ = terminal.backend_mut().flush();
+            return Err(error.into());
+        }
+        terminal.backend_mut().flush()?;
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for TerminalSuspendGuard<'_> {
+    fn drop(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture);
+        let _ = self.terminal.clear();
+        let _ = self.terminal.hide_cursor();
+        let _ = self.terminal.backend_mut().flush();
     }
 }
 
@@ -1039,10 +1252,7 @@ fn build_router(
         shutdown_tx.clone(),
         max_query_len,
     )?;
-    let router_state = RouterState {
-        app: state,
-        mcp: mcp_service.clone(),
-    };
+    let router_state = RouterState { app: state, mcp: mcp_service.clone() };
     let auth_state = AuthState { token: auth_token };
     let router = Router::new()
         .route("/", post(ingest_or_mcp_handler))
@@ -1086,14 +1296,10 @@ async fn auth_middleware(
         StatusCode::UNAUTHORIZED.into_response()
     }
 }
-async fn ingest_or_mcp_handler(
-    State(state): State<RouterState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn ingest_or_mcp_handler(State(state): State<RouterState>, body: Bytes) -> impl IntoResponse {
     let ingestor = state.app.ingestor();
     let response = ingestor.handle(&body);
-    let status =
-        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if response.status == 422 && looks_like_mcp_request(&body) {
         let request = Request::builder()
@@ -1103,12 +1309,8 @@ async fn ingest_or_mcp_handler(
             .body(Body::from(body.clone()));
 
         if let Ok(request) = request {
-            let response = state
-                .mcp
-                .clone()
-                .oneshot(request)
-                .await
-                .unwrap_or_else(|err| match err {});
+            let response =
+                state.mcp.clone().oneshot(request).await.unwrap_or_else(|err| match err {});
             return response.into_response();
         }
     }
@@ -1131,13 +1333,364 @@ fn looks_like_mcp_request(body: &Bytes) -> bool {
         }
         serde_json::Value::Array(items) => items.iter().any(|item| {
             item.as_object().is_some_and(|object| {
-                matches!(
-                    object.get("jsonrpc").and_then(|value| value.as_str()),
-                    Some("2.0")
-                ) && object.get("method").is_some()
+                matches!(object.get("jsonrpc").and_then(|value| value.as_str()), Some("2.0"))
+                    && object.get("method").is_some()
             })
         }),
         _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DemoEventKind {
+    PlainLine,
+    ColoredJson,
+    Http,
+    Sql,
+    Error,
+    LongLine,
+    MultiPayload,
+}
+
+struct DemoRng {
+    state: u64,
+}
+
+impl DemoRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // splitmix64
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn gen_range_u32(&mut self, range: std::ops::Range<u32>) -> u32 {
+        let width = range.end.saturating_sub(range.start);
+        if width == 0 {
+            return range.start;
+        }
+        range.start + (self.next_u64() % u64::from(width)) as u32
+    }
+
+    fn chance(&mut self, numerator: u32, denominator: u32) -> bool {
+        if denominator == 0 {
+            return false;
+        }
+        self.gen_range_u32(0..denominator) < numerator.min(denominator)
+    }
+
+    fn choose<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        let idx = self.gen_range_u32(0..items.len().max(1) as u32) as usize % items.len();
+        &items[idx]
+    }
+}
+
+fn demo_kind(rng: &mut DemoRng) -> DemoEventKind {
+    let roll = rng.gen_range_u32(0..100);
+    match roll {
+        0..=34 => DemoEventKind::PlainLine,
+        35..=64 => DemoEventKind::ColoredJson,
+        65..=79 => DemoEventKind::Http,
+        80..=89 => DemoEventKind::Sql,
+        90..=95 => DemoEventKind::Error,
+        96..=98 => DemoEventKind::LongLine,
+        _ => DemoEventKind::MultiPayload,
+    }
+}
+
+fn demo_tags(rng: &mut DemoRng, kind: DemoEventKind) -> Vec<&'static str> {
+    const TAGS: &[&str] = &["demo", "ui", "api", "db", "cache", "auth", "perf", "worker", "trace"];
+    let mut tags = Vec::new();
+    tags.push("demo");
+
+    match kind {
+        DemoEventKind::Http => tags.push("http"),
+        DemoEventKind::Sql => tags.push("sql"),
+        DemoEventKind::Error => tags.push("error"),
+        DemoEventKind::MultiPayload => tags.push("context"),
+        _ => {}
+    }
+
+    let extra = 1 + rng.gen_range_u32(0..3);
+    for _ in 0..extra {
+        let tag = *rng.choose(TAGS);
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+
+    tags
+}
+
+fn demo_origin(rng: &mut DemoRng) -> RayOrigin {
+    const FILES: &[&str] = &[
+        "src/api/users.rs",
+        "src/api/search.rs",
+        "src/db/mod.rs",
+        "src/ui/tui.rs",
+        "src/worker/jobs.rs",
+    ];
+    const FUNCS: &[&str] =
+        &["handle_request", "render_frame", "query_db", "rebuild_index", "flush_buffer"];
+
+    let mut origin = RayOrigin {
+        hostname: "local".to_string(),
+        function_name: None,
+        file: None,
+        line_number: None,
+    };
+
+    // Rarely attach file/function/line metadata.
+    if rng.chance(1, 20) {
+        origin.file = Some((*rng.choose(FILES)).to_string());
+        origin.function_name = Some((*rng.choose(FUNCS)).to_string());
+        origin.line_number = Some(1 + rng.gen_range_u32(0..500));
+    }
+
+    origin
+}
+
+fn demo_envelope(rng: &mut DemoRng, seq: u64) -> RayEnvelope {
+    let kind = demo_kind(rng);
+    let tags = demo_tags(rng, kind);
+
+    let meta = RayMeta {
+        project: Some("demo".to_string()),
+        host: Some("local".to_string()),
+        screen: Some("demo:local:default".to_string()),
+        session_id: None,
+    };
+
+    let uuid = Uuid::new_v4().to_string();
+
+    let payloads = match kind {
+        DemoEventKind::PlainLine => {
+            const LINES: &[&str] = &[
+                "demo: hello world",
+                "cache miss for key=user:42",
+                "rendered frame in 7ms",
+                "worker heartbeat ok",
+                "loaded config and started",
+            ];
+            vec![RayPayload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({
+                    "message": rng.choose(LINES),
+                    "tags": tags,
+                    "seq": seq,
+                }),
+                origin: demo_origin(rng),
+            }]
+        }
+        DemoEventKind::ColoredJson => {
+            const COLORS: &[(&str, &str)] =
+                &[("info", "green"), ("debug", "blue"), ("warn", "yellow"), ("log", "grey")];
+            const TOPICS: &[&str] = &["render", "search", "ingest", "index", "mcp", "tui"];
+            let (entry_type, color) = rng.choose(COLORS);
+            let topic = rng.choose(TOPICS);
+            vec![RayPayload {
+                r#type: (*entry_type).to_string(),
+                content: serde_json::json!({
+                    "message": format!("demo {topic} event #{seq}"),
+                    "color": color,
+                    "tags": tags,
+                    "data": {
+                        "topic": topic,
+                        "ok": true,
+                        "retry": rng.chance(1, 10),
+                        "count": rng.gen_range_u32(0..1000),
+                    }
+                }),
+                origin: demo_origin(rng),
+            }]
+        }
+        DemoEventKind::Http => {
+            const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE"];
+            const PATHS: &[&str] =
+                &["/api/users", "/api/sessions", "/api/search", "/health", "/api/events"];
+            let method = rng.choose(METHODS);
+            let path = rng.choose(PATHS);
+            let status_bucket = rng.gen_range_u32(0..100);
+            let status = match status_bucket {
+                0..=84 => 200,
+                85..=92 => 204,
+                93..=97 => 404,
+                _ => 500,
+            };
+            let duration_ms = 1 + rng.gen_range_u32(0..850);
+            let color = match status {
+                200..=299 => "green",
+                400..=499 => "yellow",
+                _ => "red",
+            };
+
+            vec![RayPayload {
+                r#type: "http".to_string(),
+                content: serde_json::json!({
+                    "message": format!("{method} {path} -> {status} ({duration_ms}ms)"),
+                    "color": color,
+                    "tags": tags,
+                    "method": method,
+                    "path": path,
+                    "status": status,
+                    "duration_ms": duration_ms,
+                }),
+                origin: demo_origin(rng),
+            }]
+        }
+        DemoEventKind::Sql => {
+            const QUERIES: &[&str] = &[
+                "SELECT id, email FROM users WHERE id = ?",
+                "UPDATE sessions SET last_seen = ? WHERE id = ?",
+                "INSERT INTO events(kind, payload) VALUES(?, ?)",
+                "SELECT * FROM logs ORDER BY received_at DESC LIMIT 50",
+            ];
+            let query = rng.choose(QUERIES);
+            let duration_ms = 1 + rng.gen_range_u32(0..120);
+            let rows = rng.gen_range_u32(0..50);
+            vec![RayPayload {
+                r#type: "sql".to_string(),
+                content: serde_json::json!({
+                    "message": format!("sql ({duration_ms}ms, {rows} rows)"),
+                    "color": "purple",
+                    "tags": tags,
+                    "query": query,
+                    "duration_ms": duration_ms,
+                    "rows": rows,
+                }),
+                origin: demo_origin(rng),
+            }]
+        }
+        DemoEventKind::Error => {
+            const ERRORS: &[&str] = &[
+                "timeout while calling upstream",
+                "failed to deserialize payload",
+                "db connection dropped",
+                "permission denied",
+            ];
+            let message = rng.choose(ERRORS);
+            vec![RayPayload {
+                r#type: "error".to_string(),
+                content: serde_json::json!({
+                    "message": format!("error: {message}"),
+                    "color": "red",
+                    "tags": tags,
+                    "error": {
+                        "kind": "DemoError",
+                        "message": message,
+                        "retryable": rng.chance(1, 3),
+                        "code": 1000 + rng.gen_range_u32(0..200),
+                    },
+                }),
+                origin: demo_origin(rng),
+            }]
+        }
+        DemoEventKind::LongLine => {
+            let base = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua";
+            let repeats = 2 + rng.gen_range_u32(0..6);
+            let mut message = String::new();
+            for _ in 0..repeats {
+                if !message.is_empty() {
+                    message.push(' ');
+                }
+                message.push_str(base);
+            }
+
+            vec![RayPayload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({
+                    "message": format!("demo long line #{seq}: {message}"),
+                    "color": "blue",
+                    "tags": tags,
+                    "seq": seq,
+                }),
+                origin: demo_origin(rng),
+            }]
+        }
+        DemoEventKind::MultiPayload => {
+            let payload_a = RayPayload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({
+                    "message": format!("demo multi-payload entry #{seq}"),
+                    "color": "blue",
+                    "tags": tags,
+                    "seq": seq,
+                }),
+                origin: demo_origin(rng),
+            };
+            let payload_b = RayPayload {
+                r#type: "context".to_string(),
+                content: serde_json::json!({
+                    "service": "raymon",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "pid": std::process::id(),
+                    "flags": {
+                        "demo": true,
+                    },
+                }),
+                origin: demo_origin(rng),
+            };
+            vec![payload_a, payload_b]
+        }
+    };
+
+    RayEnvelope { uuid, payloads, meta: Some(meta) }
+}
+
+async fn run_demo(
+    mut shutdown: broadcast::Receiver<()>,
+    mut paused: watch::Receiver<bool>,
+    ingestor: IngestorHandle,
+) {
+    let seed = crate::raymon_ingest::now_millis()
+        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut rng = DemoRng::new(seed);
+    let mut seq = 0u64;
+
+    // Small delay so the server/TUI are already up.
+    time::sleep(Duration::from_millis(250)).await;
+
+    loop {
+        if *paused.borrow() {
+            tokio::select! {
+                res = shutdown.recv() => {
+                    match res {
+                        Ok(()) | Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+                res = paused.changed() => { let _ = res; }
+            }
+            continue;
+        }
+
+        let delay_ms = 120 + u64::from(rng.gen_range_u32(0..330));
+        tokio::select! {
+            res = shutdown.recv() => {
+                match res {
+                    Ok(()) | Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            res = paused.changed() => { let _ = res; }
+            _ = time::sleep(Duration::from_millis(delay_ms)) => {
+                seq = seq.wrapping_add(1);
+                let envelope = demo_envelope(&mut rng, seq);
+                let Ok(payload) = serde_json::to_vec(&envelope) else {
+                    continue;
+                };
+                let response = ingestor.handle(&payload);
+                if let Some(error) = response.error {
+                    warn!(%error, "demo ingest failed");
+                }
+            }
+        }
     }
 }
 
@@ -1179,9 +1732,25 @@ pub async fn run() -> Result<(), DynError> {
     let storage_root = storage_root(&cwd, config_path.as_ref());
     info!(path = %storage_root.display(), "storage root");
 
-    let state = build_state(&storage_root)?;
+    // Archives are file-backed per TUI session; start the live stream empty.
+    let (state, initial_logs) = build_state(&storage_root, false)?;
     let (shutdown_tx, _) = broadcast::channel(4);
     let mut shutdown_rx = shutdown_tx.subscribe();
+
+    let (pause_tx, pause_rx) = if cli.demo {
+        let (pause_tx, pause_rx) = watch::channel(false);
+        (Some(pause_tx), Some(pause_rx))
+    } else {
+        (None, None)
+    };
+
+    let demo_handle = if cli.demo {
+        info!("demo mode enabled (generating local events)");
+        let paused = pause_rx.expect("pause channel configured");
+        Some(tokio::spawn(run_demo(shutdown_tx.subscribe(), paused, state.ingestor())))
+    } else {
+        None
+    };
 
     let mut server_handle = tokio::spawn(run_server(
         config.clone(),
@@ -1191,19 +1760,24 @@ pub async fn run() -> Result<(), DynError> {
     ));
 
     let tui_handle = if config.tui_enabled {
-        let tui_config = TuiConfig {
-            editor_command: config.editor.clone(),
-            ide_command: config.ide.clone(),
-            jq_command: config.jq.clone(),
-            show_archives_by_default: false,
-            max_query_len: config.max_query_len,
-            jq_timeout_ms: config.jq_timeout_ms,
-        };
+        let palette = tui_palette_override(&env_map)?;
+	        let tui_config = TuiConfig {
+	            editor_command: config.editor.clone(),
+	            ide_command: config.ide.clone(),
+	            jq_command: config.jq.clone(),
+	            palette,
+	            show_archives_by_default: false,
+	            archive_dir: Some(storage_root.join("data").join("archives")),
+	            max_query_len: config.max_query_len,
+	            jq_timeout_ms: config.jq_timeout_ms,
+	        };
         Some(tokio::spawn(run_tui(
             tui_config,
             state.bus.clone(),
+            initial_logs,
             shutdown_tx.subscribe(),
             shutdown_tx.clone(),
+            pause_tx.clone(),
         )))
     } else {
         None
@@ -1241,6 +1815,10 @@ pub async fn run() -> Result<(), DynError> {
             None => server_handle.await?,
         };
 
+        if let Some(handle) = demo_handle {
+            let _ = handle.await;
+        }
+
         tui_result?;
         server_result?;
     } else {
@@ -1261,6 +1839,9 @@ pub async fn run() -> Result<(), DynError> {
             Some(result) => result,
             None => server_handle.await?,
         };
+        if let Some(handle) = demo_handle {
+            let _ = handle.await;
+        }
         server_result?;
     }
 
@@ -1299,6 +1880,7 @@ mod tests {
         assert_eq!(cli.jq.as_deref(), Some("jq"));
         assert!(!cli.tui);
         assert!(cli.no_tui);
+        assert!(!cli.demo);
     }
 
     #[test]
@@ -1334,6 +1916,7 @@ mod tests {
             jq: None,
             tui: false,
             no_tui: true,
+            demo: false,
         };
 
         let (config, resolved_path) = resolve_config(&cli, &child, &env_map).unwrap();
@@ -1360,6 +1943,29 @@ mod tests {
     #[test]
     fn parse_u16_rejects_invalid_value() {
         let err = parse_u16("PORT", "not-a-number").unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidEnv { .. }));
+    }
+
+    #[test]
+    fn tui_palette_override_parses_valid_csv() {
+        let value = "#111111,#222222,#000000,#ff0000,#00ff00,#ffff00,#0000ff,#ff00ff,#00ffff,#cccccc,#555555,#ff5555,#55ff55,#ffff55,#5555ff,#ff55ff,#55ffff,#ffffff";
+        let mut env_map = BTreeMap::new();
+        env_map.insert("RAYMON_TUI_PALETTE".to_string(), value.to_string());
+
+        let palette = tui_palette_override(&env_map).unwrap().expect("palette");
+        assert_eq!(palette.fg, ratatui::style::Color::Rgb(0x11, 0x11, 0x11));
+        assert_eq!(palette.bg, ratatui::style::Color::Rgb(0x22, 0x22, 0x22));
+        assert_eq!(palette.ansi_color(0), ratatui::style::Color::Rgb(0, 0, 0));
+        assert_eq!(palette.ansi_color(1), ratatui::style::Color::Rgb(0xff, 0, 0));
+        assert_eq!(palette.ansi_color(2), ratatui::style::Color::Rgb(0, 0xff, 0));
+        assert_eq!(palette.ansi_color(15), ratatui::style::Color::Rgb(0xff, 0xff, 0xff));
+    }
+
+    #[test]
+    fn tui_palette_override_rejects_invalid_csv() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("RAYMON_TUI_PALETTE".to_string(), "#000000,#111111".to_string());
+        let err = tui_palette_override(&env_map).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidEnv { .. }));
     }
 
@@ -1411,5 +2017,44 @@ mod tests {
         assert!(search.search_text.contains("red"));
         assert_eq!(search.types, vec!["log".to_string()]);
         assert_eq!(search.colors, vec!["red".to_string()]);
+    }
+
+    #[test]
+    fn build_state_restores_entries_from_storage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let mut storage = RaymonStorage::new(root).expect("storage");
+
+        let screen = Screen::new("proj:host:default");
+        let entry = CoreEntry {
+            uuid: "entry-restore-1".to_string(),
+            received_at: 1,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({ "message": "hello" }),
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        };
+
+        let input = entry_to_storage_input(&entry).expect("storage input");
+        storage.append_entry(input).expect("append");
+
+        let (state, logs) = build_state(root, true).expect("build state");
+        let restored = state.core.get(&entry.uuid).expect("get entry");
+        assert!(restored.is_some());
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "hello");
     }
 }

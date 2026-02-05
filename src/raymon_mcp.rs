@@ -5,13 +5,12 @@ use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use crate::raymon_core::{Event, EventBus, Filters, Screen, StateStore};
 use rmcp::{
-    ErrorData as McpError, Json, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CustomNotification, CustomRequest, CustomResult, InitializeRequestParams, InitializeResult,
@@ -19,14 +18,15 @@ use rmcp::{
     },
     tool, tool_handler, tool_router,
     transport::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        streamable_http_server::session::local::LocalSessionManager,
+        streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
+        StreamableHttpService,
     },
+    ErrorData as McpError, Json, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 /// Streamable HTTP service type for mounting on `/mcp` with axum/tower.
 pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSessionManager>;
@@ -133,10 +133,8 @@ where
             return Ok(());
         }
 
-        let mut subscription = self
-            .bus
-            .subscribe()
-            .map_err(|err| McpInitError::EventBus(err.to_string()))?;
+        let mut subscription =
+            self.bus.subscribe().map_err(|err| McpInitError::EventBus(err.to_string()))?;
         let peers = self.peers.clone();
         let handle = tokio::runtime::Handle::try_current().map_err(|_| McpInitError::NoRuntime)?;
 
@@ -193,11 +191,7 @@ where
     ) -> Result<RaymonMcpService<S, B>, McpInitError> {
         let handler = RaymonMcp::new(state, bus);
         handler.start_event_forwarder()?;
-        Ok(StreamableHttpService::new(
-            move || Ok(handler.clone()),
-            Default::default(),
-            config,
-        ))
+        Ok(StreamableHttpService::new(move || Ok(handler.clone()), Default::default(), config))
     }
 
     async fn register_peer(&self, peer: rmcp::Peer<rmcp::RoleServer>) {
@@ -241,10 +235,7 @@ where
     }
 
     fn maybe_quit(&self, method: &str) {
-        if !matches!(
-            method,
-            "ray/quit" | "ray/exit" | "raymon/quit" | "raymon/exit"
-        ) {
+        if !matches!(method, "ray/quit" | "ray/exit" | "raymon/quit" | "raymon/exit") {
             return;
         }
         if let Some(shutdown) = &self.shutdown {
@@ -270,11 +261,7 @@ where
         if let Some(query) = params.query.as_ref() {
             if query.len() > self.max_query_len {
                 return Err(McpError::invalid_params(
-                    format!(
-                        "query too long ({} bytes > max {})",
-                        query.len(),
-                        self.max_query_len
-                    ),
+                    format!("query too long ({} bytes > max {})", query.len(), self.max_query_len),
                     None,
                 ));
             }
@@ -283,16 +270,9 @@ where
         let mut filters = Self::map_filters(&params);
         filters.limit = Some(limit);
         filters.offset = offset;
-        let entries = self
-            .state
-            .list_entries(&filters)
-            .map_err(Self::state_error)?;
+        let entries = self.state.list_entries(&filters).map_err(Self::state_error)?;
         let summaries = entries.into_iter().map(EntrySummary::from).collect::<Vec<_>>();
-        Ok(Json(ListEntriesResult {
-            entries: summaries,
-            limit,
-            offset,
-        }))
+        Ok(Json(ListEntriesResult { entries: summaries, limit, offset }))
     }
 
     #[tool(name = "ray.get_entry", description = "Fetch a single entry by UUID")]
@@ -300,20 +280,14 @@ where
         &self,
         Parameters(params): Parameters<GetEntryParams>,
     ) -> Result<Json<GetEntryResult>, McpError> {
-        let entry = self
-            .state
-            .get_entry(&params.uuid)
-            .map_err(Self::state_error)?;
+        let entry = self.state.get_entry(&params.uuid).map_err(Self::state_error)?;
         let entry = entry.map(McpEntry::from);
         Ok(Json(GetEntryResult { entry }))
     }
 
     #[tool(name = "ray.list_screens", description = "List screens available in state")]
     async fn list_screens(&self) -> Result<Json<ListScreensResult>, McpError> {
-        let screens = self
-            .state
-            .list_screens()
-            .map_err(Self::state_error)?;
+        let screens = self.state.list_screens().map_err(Self::state_error)?;
         Ok(Json(ListScreensResult {
             screens: screens.into_iter().map(|screen| screen.as_str().to_string()).collect(),
         }))
@@ -345,9 +319,7 @@ where
         let screen = Screen::new(params.screen);
         let mut state = self.state.clone();
         state.clear_screen(&screen).map_err(Self::state_error)?;
-        self.bus
-            .emit(Event::ScreenCleared(screen))
-            .map_err(Self::bus_error)?;
+        self.bus.emit(Event::ScreenCleared(screen)).map_err(Self::bus_error)?;
         Ok(Json(ClearResult { ok: true }))
     }
 
@@ -355,9 +327,7 @@ where
     async fn clear_all(&self) -> Result<Json<ClearResult>, McpError> {
         let mut state = self.state.clone();
         state.clear_all().map_err(Self::state_error)?;
-        self.bus
-            .emit(Event::StateCleared)
-            .map_err(Self::bus_error)?;
+        self.bus.emit(Event::StateCleared).map_err(Self::bus_error)?;
         Ok(Json(ClearResult { ok: true }))
     }
 }
@@ -624,10 +594,7 @@ fn event_to_notification(event: Event) -> ServerNotification {
         Event::ScreenCleared(screen) => json!({ "type": "screen_cleared", "screen": screen }),
         Event::StateCleared => json!({ "type": "state_cleared" }),
     };
-    ServerNotification::CustomNotification(CustomNotification::new(
-        "ray/event",
-        Some(payload),
-    ))
+    ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
 }
 
 async fn broadcast_notification(
@@ -644,8 +611,8 @@ async fn broadcast_notification(
 mod tests {
     use super::*;
     use crate::raymon_core::{default_screen_name, Entry, Origin, Payload};
-    use rmcp::model::ErrorCode;
     use rmcp::handler::server::common::schema_for_type;
+    use rmcp::model::ErrorCode;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -684,9 +651,8 @@ mod tests {
 
         fn list_entries(&self, filters: &Filters) -> Result<Vec<Entry>, Self::Error> {
             *self.last_filters.lock().unwrap() = Some(filters.clone());
-            let filtered = filters
-                .apply(self.entries.iter())
-                .map_err(|err| TestError(err.to_string()))?;
+            let filtered =
+                filters.apply(self.entries.iter()).map_err(|err| TestError(err.to_string()))?;
             Ok(filtered.into_iter().cloned().collect())
         }
 
@@ -712,10 +678,7 @@ mod tests {
     impl TestBus {
         fn new() -> Self {
             let (sender, _) = broadcast::channel(16);
-            Self {
-                sender,
-                emitted: Arc::new(Mutex::new(Vec::new())),
-            }
+            Self { sender, emitted: Arc::new(Mutex::new(Vec::new())) }
         }
 
         fn emitted(&self) -> Vec<Event> {
@@ -748,11 +711,8 @@ mod tests {
             file: None,
             line_number: None,
         };
-        let payload = Payload {
-            r#type: "note".to_string(),
-            content: json!({"message": "alpha"}),
-            origin,
-        };
+        let payload =
+            Payload { r#type: "note".to_string(), content: json!({"message": "alpha"}), origin };
         Entry {
             uuid: uuid.to_string(),
             received_at: 1,
@@ -782,17 +742,9 @@ mod tests {
             ..Default::default()
         };
 
-        handler
-            .list_entries(Parameters(params))
-            .await
-            .expect("list_entries should succeed");
+        handler.list_entries(Parameters(params)).await.expect("list_entries should succeed");
 
-        let filters = store
-            .last_filters
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("filters captured");
+        let filters = store.last_filters.lock().unwrap().clone().expect("filters captured");
         assert_eq!(filters.query, Some("alpha".to_string()));
         assert_eq!(filters.screen, Some(Screen::new("main")));
         assert_eq!(filters.limit, Some(10));
@@ -815,10 +767,7 @@ mod tests {
             data: Some(serde_json::to_value(&entry).unwrap()),
         };
 
-        handler
-            .emit(Parameters(params))
-            .await
-            .unwrap();
+        handler.emit(Parameters(params)).await.unwrap();
         assert_eq!(bus.emitted().len(), 1);
     }
 
@@ -867,10 +816,7 @@ mod tests {
         let handler = RaymonMcp::new(store, bus);
 
         let params = ListEntriesParams::default();
-        let result = handler
-            .list_entries(Parameters(params))
-            .await
-            .unwrap();
+        let result = handler.list_entries(Parameters(params)).await.unwrap();
         assert_eq!(result.0.entries.len(), DEFAULT_LIST_LIMIT);
         let first = result.0.entries.first().expect("first entry");
         assert!(first.payload_count > 0);
@@ -921,13 +867,8 @@ mod tests {
         let bus = TestBus::new();
         let handler = RaymonMcp::new(store, bus);
 
-        let params = ListEntriesParams {
-            query: Some("(/".to_string()),
-            ..Default::default()
-        };
-        let result = handler
-            .list_entries(Parameters(params))
-            .await;
+        let params = ListEntriesParams { query: Some("(/".to_string()), ..Default::default() };
+        let result = handler.list_entries(Parameters(params)).await;
 
         let error = match result {
             Ok(_) => panic!("expected invalid params error"),

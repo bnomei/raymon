@@ -39,7 +39,6 @@ pub enum HelpMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
-    Logs,
     Screens,
     Archives,
     Colors,
@@ -48,7 +47,6 @@ pub enum PickerKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerItemId {
-    Log(usize),
     Screen(String),
     Archive(usize),
     Color(String),
@@ -489,21 +487,6 @@ impl Tui {
         self.state.show_help = false;
     }
 
-    fn open_log_picker(&mut self) {
-        let indices = self.base_filter_indices();
-        let items: Vec<PickerItem> = indices
-            .iter()
-            .filter_map(|idx| self.state.logs.get(*idx).map(|entry| (idx, entry)))
-            .map(|(idx, entry)| PickerItem {
-                label: entry.message.clone(),
-                meta: entry.entry_type.clone(),
-                id: PickerItemId::Log(*idx),
-                active: false,
-            })
-            .collect();
-        self.open_picker(PickerState::new(PickerKind::Logs, items, false));
-    }
-
     fn open_screen_picker(&mut self) {
         let mut screens = self.state.screens.clone();
         screens.sort();
@@ -598,18 +581,8 @@ impl Tui {
     }
 
     fn available_colors(&self) -> Vec<String> {
-        let mut colors = BTreeSet::new();
-        for entry in &self.state.logs {
-            if let Some(value) = entry.color.as_deref() {
-                if self.state.active_screen.as_deref().is_some_and(|screen| {
-                    entry.screen.as_deref() != Some(screen)
-                }) {
-                    continue;
-                }
-                colors.insert(normalize_label(value));
-            }
-        }
-        colors.into_iter().collect()
+        const OFFICIAL_COLORS: [&str; 6] = ["green", "yellow", "red", "purple", "blue", "grey"];
+        OFFICIAL_COLORS.into_iter().map(|color| color.to_string()).collect()
     }
 
     fn select_log_index(&mut self, log_index: usize) {
@@ -1079,13 +1052,6 @@ impl Tui {
                 exit = false;
             }
             KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
-                self.open_log_picker();
-            }
-            KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers: KeyModifiers::NONE,
                 ..
@@ -1328,9 +1294,6 @@ impl Tui {
 
     fn apply_picker_selection(&mut self, item: PickerItemId) {
         match item {
-            PickerItemId::Log(idx) => {
-                self.select_log_index(idx);
-            }
             PickerItemId::Screen(name) => {
                 self.state.active_screen = Some(name);
                 self.recompute_filter();
@@ -1413,7 +1376,7 @@ impl Tui {
     }
 
     fn render_top_bar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let status = if self.state.paused { "Paused" } else { "Live" };
+        let status = if self.state.paused { "⏸ Pause" } else { "‣ Live" };
         let mode = format!("{:?}", self.state.mode);
         let input = match self.state.mode {
             Mode::Search => {
@@ -1558,8 +1521,8 @@ impl Tui {
         frame.render_widget(Clear, area);
         let text = match self.state.help_mode {
             HelpMode::Space => vec![
-                Line::from("Space modal"),
-                Line::from("f logs picker  r regex search  s screens picker"),
+                Line::from(""),
+                Line::from("r regex search  s screens picker"),
                 Line::from("c color filters  t type filters  j jq detail search"),
                 Line::from("a archives picker  q quit  ? keymap help  Esc close"),
             ],
@@ -1567,13 +1530,14 @@ impl Tui {
                 Line::from("Normal: j/down move, up move, / or f search, : detail search, p pause"),
                 Line::from("k clear screen, z expand JSON, Z raw JSON, y/Y yank, Ctrl+y paste"),
                 Line::from("1 ts 2 file 3 color 4 labels, a archives, e editor, o origin"),
-                Line::from("Space: f logs, r regex, s screens, c colors, t types, j jq, a archives"),
+                Line::from("Space: r regex, s screens, c colors, t types, j jq, a archives"),
             ],
         };
         let title = match self.state.help_mode {
-            HelpMode::Space => "Space",
+            HelpMode::Space => "Menu",
             HelpMode::Keymap => "Keymap",
         };
+        let title = format!(" ─ {title} ─");
         let block = Block::default().borders(Borders::ALL).title(title);
         let paragraph = Paragraph::new(text)
             .block(block)
@@ -1590,12 +1554,12 @@ impl Tui {
         frame.render_widget(Clear, area);
 
         let title = match picker.kind {
-            PickerKind::Logs => "Logs",
             PickerKind::Screens => "Screens",
             PickerKind::Archives => "Archived Screens",
             PickerKind::Colors => "Color Filters",
             PickerKind::Types => "Type Filters",
         };
+        let title = format!(" ─ {title} ─");
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -2235,13 +2199,13 @@ mod tests {
             PickerItem {
                 label: "alpha".to_string(),
                 meta: None,
-                id: PickerItemId::Log(0),
+                id: PickerItemId::Screen("alpha".to_string()),
                 active: false,
             },
             PickerItem {
                 label: "beta".to_string(),
                 meta: None,
-                id: PickerItemId::Log(1),
+                id: PickerItemId::Screen("beta".to_string()),
                 active: false,
             },
         ];
@@ -2286,7 +2250,14 @@ mod tests {
             tui.state.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Colors)
         );
-        tui.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        let picker = tui.state.picker.as_ref().expect("picker");
+        assert_eq!(picker.items.len(), 7);
+        assert!(picker.items.iter().any(|item| item.label == "green"));
+        assert!(picker.items.iter().any(|item| item.label == "grey"));
+
+        for _ in 0..5 {
+            tui.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
         tui.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(tui.state.filters.colors.contains("blue"));
         assert_eq!(tui.state.filtered.len(), 1);
@@ -2322,21 +2293,6 @@ mod tests {
         tui.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(tui.state.active_screen.as_deref(), Some("main"));
         assert_eq!(tui.state.filtered.len(), 2);
-    }
-
-    #[rstest]
-    fn space_f_selects_log() {
-        let (mut tui, _) = make_tui();
-        seed_logs(&mut tui);
-        tui.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
-        tui.handle_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert_eq!(
-            tui.state.picker.as_ref().map(|picker| picker.kind),
-            Some(PickerKind::Logs)
-        );
-        tui.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE));
-        tui.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(tui.state.selected, 1);
     }
 
     #[rstest]

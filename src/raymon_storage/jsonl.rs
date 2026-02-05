@@ -8,11 +8,7 @@ use super::{StorageError, StoredEntry};
 
 pub(crate) fn append_entry(path: &Path, entry: &StoredEntry) -> Result<(u64, u64), StorageError> {
     let line = serde_json::to_vec(entry)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).read(true).open(path)?;
     let offset = file.metadata()?.len();
     file.write_all(&line)?;
     file.write_all(b"\n")?;

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{BLOBS_DIR, StorageError};
+use super::{StorageError, BLOBS_DIR};
 
 static BLOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -20,10 +20,7 @@ pub(crate) fn store_blob(blobs_dir: &Path, bytes: &[u8]) -> Result<(String, u64)
 }
 
 fn generate_blob_name() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let counter = BLOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("blob-{}-{}", now, counter)
 }

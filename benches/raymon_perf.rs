@@ -1,8 +1,11 @@
+#[path = "../src/colors.rs"]
+mod colors;
+
 #[path = "../src/raymon_core.rs"]
 mod raymon_core;
 
 use raymon_core::{Entry, Filters, Origin, Payload, Screen};
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 fn main() {
     divan::main();
@@ -189,9 +192,7 @@ fn filters_substring_string_miss_parallel(bencher: divan::Bencher, len: usize) {
     filters.query = Some("does-not-exist".to_string());
 
     bencher.counter(len).bench(|| {
-        let matched = filters
-            .apply_parallel(&entries)
-            .expect("filters apply_parallel");
+        let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
         divan::black_box(matched.len());
     });
 }
@@ -215,9 +216,7 @@ fn filters_substring_string_miss_realistic_parallel(bencher: divan::Bencher, len
     filters.query = Some("does-not-exist".to_string());
 
     bencher.counter(len).bench(|| {
-        let matched = filters
-            .apply_parallel(&entries)
-            .expect("filters apply_parallel");
+        let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
         divan::black_box(matched.len());
     });
 }
@@ -253,9 +252,7 @@ fn filters_substring_object_miss_parallel(bencher: divan::Bencher, len: usize) {
     filters.query = Some("does-not-exist".to_string());
 
     bencher.counter(len).bench(|| {
-        let matched = filters
-            .apply_parallel(&entries)
-            .expect("filters apply_parallel");
+        let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
         divan::black_box(matched.len());
     });
 }
@@ -279,9 +276,7 @@ fn filters_substring_object_miss_many_string_fields_parallel(bencher: divan::Ben
     filters.query = Some("does-not-exist".to_string());
 
     bencher.counter(len).bench(|| {
-        let matched = filters
-            .apply_parallel(&entries)
-            .expect("filters apply_parallel");
+        let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
         divan::black_box(matched.len());
     });
 }
@@ -305,9 +300,7 @@ fn filters_substring_object_miss_realistic_parallel(bencher: divan::Bencher, len
     filters.query = Some("does-not-exist".to_string());
 
     bencher.counter(len).bench(|| {
-        let matched = filters
-            .apply_parallel(&entries)
-            .expect("filters apply_parallel");
+        let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
         divan::black_box(matched.len());
     });
 }
@@ -345,9 +338,7 @@ fn filters_substring_object_hit_limit_1_parallel(bencher: divan::Bencher, len: u
     filters.limit = Some(1);
 
     bencher.counter(len).bench(|| {
-        let matched = filters
-            .apply_parallel(&entries)
-            .expect("filters apply_parallel");
+        let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
         divan::black_box(matched.len());
     });
 }

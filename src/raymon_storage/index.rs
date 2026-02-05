@@ -7,7 +7,10 @@ use regex::Regex;
 use serde_json::Value;
 use smol_str::SmolStr;
 
-use crate::raymon_core::{Entry as CoreEntry, FilterError as CoreFilterError, Filters as CoreFilters};
+use crate::colors::canonical_color_name;
+use crate::raymon_core::{
+    Entry as CoreEntry, FilterError as CoreFilterError, Filters as CoreFilters,
+};
 
 use super::{jsonl, EntryFilter, OffsetMeta, StorageError, StoredEntry, StoredPayload};
 
@@ -41,7 +44,8 @@ impl Index {
     }
 
     pub(crate) fn list(&self, filter: Option<&EntryFilter>) -> Vec<OffsetMeta> {
-        let (offset, limit) = filter.map(|filter| (filter.offset, filter.limit)).unwrap_or((0, None));
+        let (offset, limit) =
+            filter.map(|filter| (filter.offset, filter.limit)).unwrap_or((0, None));
         let query_lower = filter
             .and_then(|filter| filter.query.as_deref())
             .map(str::trim)
@@ -144,12 +148,7 @@ impl Index {
             }
         }
 
-        Ok(apply_offset_limit_sequential(
-            &self.order,
-            &self.by_id,
-            filters,
-            matcher.as_ref(),
-        ))
+        Ok(apply_offset_limit_sequential(&self.order, &self.by_id, filters, matcher.as_ref()))
     }
 }
 
@@ -179,11 +178,7 @@ pub(crate) fn record_from_entry(entry: &StoredEntry, offset: u64, len: u64) -> I
         len,
     };
 
-    IndexRecord {
-        meta,
-        types: core_meta.types,
-        colors: core_meta.colors,
-    }
+    IndexRecord { meta, types: core_meta.types, colors: core_meta.colors }
 }
 
 #[derive(Debug, Default)]
@@ -194,10 +189,16 @@ struct CoreMetadata {
 
 fn derive_core_metadata(entry: &StoredEntry) -> CoreMetadata {
     if !entry.types.is_empty() || !entry.colors.is_empty() {
-        return CoreMetadata {
-            types: entry.types.clone(),
-            colors: entry.colors.clone(),
-        };
+        let mut colors = Vec::new();
+        let mut seen_colors = HashSet::new();
+        for color in &entry.colors {
+            if let Some(color) = canonical_color_name(color) {
+                if seen_colors.insert(color) {
+                    colors.push(color.to_string());
+                }
+            }
+        }
+        return CoreMetadata { types: entry.types.clone(), colors };
     }
 
     let text = match &entry.payload {
@@ -218,8 +219,10 @@ fn derive_core_metadata(entry: &StoredEntry) -> CoreMetadata {
             types.push(payload.r#type.clone());
         }
         if let Some(color) = payload_color(&payload.content) {
-            if seen_colors.insert(color) {
-                colors.push(color.to_string());
+            if let Some(color) = canonical_color_name(color) {
+                if seen_colors.insert(color) {
+                    colors.push(color.to_string());
+                }
             }
         }
     }
@@ -266,11 +269,16 @@ impl IndexRecord {
         }
 
         if !filters.colors.is_empty() {
+            let normalized: Vec<&str> = filters
+                .colors
+                .iter()
+                .filter_map(|value| canonical_color_name(value))
+                .collect();
+            if normalized.is_empty() {
+                return false;
+            }
             if self.colors.is_empty()
-                || !filters
-                    .colors
-                    .iter()
-                    .any(|filter_color| self.colors.iter().any(|value| value == filter_color))
+                || !normalized.iter().any(|filter_color| self.colors.iter().any(|value| value == filter_color))
             {
                 return false;
             }

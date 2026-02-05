@@ -49,9 +49,7 @@ pub mod types {
 
     impl Origin {
         pub fn screen_or_default(&self) -> Screen {
-            self.screen
-                .clone()
-                .unwrap_or_else(|| default_screen_name(&self.project, &self.host))
+            self.screen.clone().unwrap_or_else(|| default_screen_name(&self.project, &self.host))
         }
     }
 
@@ -72,13 +70,7 @@ pub mod types {
             session_id: Option<SessionId>,
             received_at: Timestamp,
         ) -> Self {
-            Self {
-                project: project.into(),
-                host: host.into(),
-                screen,
-                session_id,
-                received_at,
-            }
+            Self { project: project.into(), host: host.into(), screen, session_id, received_at }
         }
 
         pub fn from_origin(origin: &Origin, received_at: Timestamp) -> Self {
@@ -113,10 +105,8 @@ pub mod types {
             payloads: &[RayPayload],
             received_at: Timestamp,
         ) -> Self {
-            let project = normalize_component(
-                meta.and_then(|meta| meta.project.as_deref()),
-                "unknown",
-            );
+            let project =
+                normalize_component(meta.and_then(|meta| meta.project.as_deref()), "unknown");
             let host = normalize_component(
                 meta.and_then(|meta| meta.host.as_deref())
                     .or_else(|| payloads.first().map(|payload| payload.origin.hostname.as_str())),
@@ -310,16 +300,13 @@ pub mod types {
     }
 
     fn normalize_component(value: Option<&str>, fallback: &str) -> String {
-        value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(fallback)
-            .to_string()
+        value.map(str::trim).filter(|value| !value.is_empty()).unwrap_or(fallback).to_string()
     }
 }
 
 pub mod filters {
     use super::types::{Entry, Payload, Screen};
+    use crate::colors::canonical_color_name;
     use memchr::{memchr, memchr2};
     #[cfg(feature = "rayon")]
     use rayon::prelude::*;
@@ -467,10 +454,7 @@ pub mod filters {
                 return true;
             }
 
-            entry
-                .payloads
-                .iter()
-                .any(|payload| self.matches_payload(payload, query))
+            entry.payloads.iter().any(|payload| self.matches_payload(payload, query))
         }
 
         fn has_payload_filters(&self, query: Option<&QueryMatcher>) -> bool {
@@ -486,7 +470,12 @@ pub mod filters {
                 let payload_color = payload_color(payload);
                 match payload_color {
                     Some(color) => {
-                        if !self.colors.iter().any(|candidate| candidate == color) {
+                        if !self
+                            .colors
+                            .iter()
+                            .filter_map(|candidate| canonical_color_name(candidate))
+                            .any(|candidate| candidate == color)
+                        {
                             return false;
                         }
                     }
@@ -524,7 +513,7 @@ pub mod filters {
 
     fn payload_color(payload: &Payload) -> Option<&str> {
         match payload.content.get("color") {
-            Some(Value::String(value)) => Some(value.as_str()),
+            Some(Value::String(value)) => canonical_color_name(value),
             _ => None,
         }
     }
@@ -576,10 +565,7 @@ pub mod filters {
                 return false;
             }
             let candidate = &haystack[start..start + needle_lower.len()];
-            if candidate
-                .iter()
-                .zip(needle_lower.iter())
-                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+            if candidate.iter().zip(needle_lower.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n)
             {
                 return true;
             }
@@ -632,7 +618,9 @@ pub mod filters {
                     stack.push(value);
                 }
             }
-            Value::Number(number) => return query_may_match_numbers && number.to_string().contains(query_lower),
+            Value::Number(number) => {
+                return query_may_match_numbers && number.to_string().contains(query_lower)
+            }
             Value::Bool(value) => {
                 return (*value && query_lower == "true") || (!*value && query_lower == "false");
             }
@@ -741,13 +729,9 @@ pub mod filters {
     }
 
     fn compile_regex(pattern: &str) -> Result<Regex, FilterError> {
-        RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .build()
-            .map_err(|error| FilterError::InvalidRegex {
-                pattern: pattern.to_string(),
-                message: error.to_string(),
-            })
+        RegexBuilder::new(pattern).case_insensitive(true).build().map_err(|error| {
+            FilterError::InvalidRegex { pattern: pattern.to_string(), message: error.to_string() }
+        })
     }
 
     #[derive(Clone, Debug)]
@@ -900,7 +884,11 @@ mod tests {
     #[case("/Hello.*there/", false)]
     #[case("/hello.*there/", false)]
     #[case("Hello.*there", true)]
-    fn filters_support_regex_queries(entry_with_payloads: Entry, #[case] query: &str, #[case] is_regex: bool) {
+    fn filters_support_regex_queries(
+        entry_with_payloads: Entry,
+        #[case] query: &str,
+        #[case] is_regex: bool,
+    ) {
         let mut filters = Filters::default();
         filters.query = Some(query.to_string());
         filters.query_is_regex = is_regex;

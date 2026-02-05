@@ -139,13 +139,7 @@ impl Storage {
 
         let index = index::rebuild(&entries_path)?;
 
-        Ok(Self {
-            root,
-            data_dir,
-            entries_path,
-            blobs_dir,
-            index,
-        })
+        Ok(Self { root, data_dir, entries_path, blobs_dir, index })
     }
 
     pub fn append_entry(&mut self, entry: EntryInput) -> Result<OffsetMeta, StorageError> {
@@ -222,13 +216,13 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstest::rstest;
-    use rstest::fixture;
-    use serde_json::json;
-    use tempfile::TempDir;
     use crate::raymon_core::{
         Entry as CoreEntry, Filters as CoreFilters, Origin, Payload as CorePayload, Screen,
     };
+    use rstest::fixture;
+    use rstest::rstest;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     struct TempStorage {
         _dir: TempDir,
@@ -269,19 +263,14 @@ mod tests {
         let meta = storage.append_entry(input).expect("append entry");
         assert!(meta.len > 0);
 
-        let entry = storage
-            .get_entry_by_offset(meta.offset, meta.len)
-            .expect("read entry");
+        let entry = storage.get_entry_by_offset(meta.offset, meta.len).expect("read entry");
         assert_eq!(entry.id, "entry-1");
         match entry.payload {
             StoredPayload::Text { text } => assert_eq!(text, "payload"),
             StoredPayload::Blob { .. } => panic!("expected text payload"),
         }
 
-        let filter = EntryFilter {
-            screen: Some("home".to_string()),
-            ..EntryFilter::default()
-        };
+        let filter = EntryFilter { screen: Some("home".to_string()), ..EntryFilter::default() };
         let listed = storage.list_entries(Some(&filter));
         assert_eq!(listed.len(), 1);
     }
@@ -323,10 +312,7 @@ mod tests {
         let listed = storage.list_entries(None);
         assert_eq!(listed.len(), 2);
 
-        let entry = storage
-            .get_entry_by_id("entry-2")
-            .expect("get entry")
-            .expect("missing entry");
+        let entry = storage.get_entry_by_id("entry-2").expect("get entry").expect("missing entry");
         assert_eq!(entry.summary, "second");
     }
 
@@ -349,9 +335,7 @@ mod tests {
         };
 
         let meta = storage.append_entry(input).expect("append entry");
-        let entry = storage
-            .get_entry_by_offset(meta.offset, meta.len)
-            .expect("read entry");
+        let entry = storage.get_entry_by_offset(meta.offset, meta.len).expect("read entry");
 
         match entry.payload {
             StoredPayload::Blob { path, size } => {
@@ -385,10 +369,7 @@ mod tests {
             colors: Vec::new(),
             payload: EntryPayload::Text("payload".to_string()),
         };
-        temp_storage
-            .storage
-            .append_entry(input)
-            .expect("append entry");
+        temp_storage.storage.append_entry(input).expect("append entry");
 
         let filter = EntryFilter {
             screen: Some(screen.to_string()),
@@ -414,15 +395,9 @@ mod tests {
             colors: Vec::new(),
             payload: EntryPayload::Text("payload".to_string()),
         };
-        temp_storage
-            .storage
-            .append_entry(input)
-            .expect("append entry");
+        temp_storage.storage.append_entry(input).expect("append entry");
 
-        let filter = EntryFilter {
-            screen: Some("work".to_string()),
-            ..EntryFilter::default()
-        };
+        let filter = EntryFilter { screen: Some("work".to_string()), ..EntryFilter::default() };
         let listed = temp_storage.storage.list_entries(Some(&filter));
         assert_eq!(listed.len(), 0);
     }
@@ -450,14 +425,7 @@ mod tests {
 
         let listed = storage.list_entries(None);
         let ids: Vec<String> = listed.into_iter().map(|meta| meta.id.to_string()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "entry-1".to_string(),
-                "entry-2".to_string(),
-                "entry-3".to_string()
-            ]
-        );
+        assert_eq!(ids, vec!["entry-1".to_string(), "entry-2".to_string(), "entry-3".to_string()]);
     }
 
     #[test]
@@ -481,11 +449,7 @@ mod tests {
             storage.append_entry(input).expect("append entry");
         }
 
-        let filter = EntryFilter {
-            offset: 1,
-            limit: Some(2),
-            ..EntryFilter::default()
-        };
+        let filter = EntryFilter { offset: 1, limit: Some(2), ..EntryFilter::default() };
         let listed = storage.list_entries(Some(&filter));
         let ids: Vec<String> = listed.into_iter().map(|meta| meta.id.to_string()).collect();
         assert_eq!(ids, vec!["entry-2".to_string(), "entry-3".to_string()]);
@@ -552,9 +516,7 @@ mod tests {
         filters.screen = Some(core_entry.screen.clone());
         filters.limit = Some(1);
 
-        let listed = storage
-            .list_entries_core(&filters)
-            .expect("list core entries");
+        let listed = storage.list_entries_core(&filters).expect("list core entries");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id.as_str(), "entry-core");
     }
@@ -594,9 +556,7 @@ mod tests {
         let mut filters = CoreFilters::default();
         filters.types = vec!["log".to_string()];
 
-        let listed = storage
-            .list_entries_core(&filters)
-            .expect("list core entries");
+        let listed = storage.list_entries_core(&filters).expect("list core entries");
         assert!(listed.is_empty());
     }
 }

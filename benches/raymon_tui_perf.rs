@@ -1,3 +1,6 @@
+#[path = "../src/colors.rs"]
+mod colors;
+
 #[path = "../src/raymon_tui.rs"]
 mod raymon_tui;
 
@@ -12,7 +15,7 @@ fn make_items(len: usize) -> Vec<PickerItem> {
         .map(|idx| PickerItem {
             label: format!("alpha-item-{idx:05}"),
             meta: None,
-            id: PickerItemId::Log(idx),
+            id: PickerItemId::Screen(format!("bench-{idx}")),
             active: false,
         })
         .collect()

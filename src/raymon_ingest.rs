@@ -18,18 +18,12 @@ pub struct IngestResponse {
 
 impl IngestResponse {
     pub fn ok() -> Self {
-        Self {
-            status: 200,
-            error: None,
-        }
+        Self { status: 200, error: None }
     }
 
     pub fn from_error(error: IngestError) -> Self {
         let status = error.status_code();
-        Self {
-            status,
-            error: Some(error.to_string()),
-        }
+        Self { status, error: Some(error.to_string()) }
     }
 }
 
@@ -123,12 +117,7 @@ where
     C: Fn() -> u64,
 {
     pub fn new(state: S, storage: T, bus: B, clock: C) -> Self {
-        Self {
-            state,
-            storage,
-            bus,
-            clock,
-        }
+        Self { state, storage, bus, clock }
     }
 
     pub fn handle(&self, body: &[u8]) -> IngestResponse {
@@ -151,28 +140,15 @@ where
 
         let entry = envelope.into_entry((self.clock)());
 
-        let existing = self
-            .state
-            .get_entry(&entry.uuid)
-            .map_err(IngestError::StateStore)?;
+        let existing = self.state.get_entry(&entry.uuid).map_err(IngestError::StateStore)?;
 
-        self.storage
-            .append_entry(&entry)
-            .map_err(IngestError::Storage)?;
+        self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
         if existing.is_some() {
-            self.state
-                .update_entry(entry.clone())
-                .map_err(IngestError::StateStore)?;
-            self.bus
-                .emit(Event::EntryUpdated(entry.clone()))
-                .map_err(IngestError::EventBus)?;
+            self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
+            self.bus.emit(Event::EntryUpdated(entry.clone())).map_err(IngestError::EventBus)?;
         } else {
-            self.state
-                .insert_entry(entry.clone())
-                .map_err(IngestError::StateStore)?;
-            self.bus
-                .emit(Event::EntryInserted(entry.clone()))
-                .map_err(IngestError::EventBus)?;
+            self.state.insert_entry(entry.clone()).map_err(IngestError::StateStore)?;
+            self.bus.emit(Event::EntryInserted(entry.clone())).map_err(IngestError::EventBus)?;
         }
 
         Ok(entry)
@@ -211,9 +187,7 @@ where
     B: EventBus + Send + Sync + 'static,
     C: Fn() -> u64 + Send + Sync + 'static,
 {
-    Router::new()
-        .route("/", post(ingest_handler::<S, T, B, C>))
-        .with_state(ingestor)
+    Router::new().route("/", post(ingest_handler::<S, T, B, C>)).with_state(ingestor)
 }
 
 async fn ingest_handler<S, T, B, C>(
@@ -227,8 +201,7 @@ where
     C: Fn() -> u64 + Send + Sync + 'static,
 {
     let response = ingestor.handle(&bytes);
-    let status =
-        StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     match response.error {
         Some(error) => (status, error).into_response(),
@@ -251,18 +224,12 @@ mod tests {
 
     impl StateStore for TestState {
         fn insert_entry(&self, entry: Entry) -> Result<(), String> {
-            self.entries
-                .lock()
-                .map_err(|_| "state poisoned".to_string())?
-                .push(entry);
+            self.entries.lock().map_err(|_| "state poisoned".to_string())?.push(entry);
             Ok(())
         }
 
         fn update_entry(&self, entry: Entry) -> Result<(), String> {
-            let mut guard = self
-                .entries
-                .lock()
-                .map_err(|_| "state poisoned".to_string())?;
+            let mut guard = self.entries.lock().map_err(|_| "state poisoned".to_string())?;
             if let Some(existing) = guard.iter_mut().find(|item| item.uuid == entry.uuid) {
                 *existing = entry;
             } else {
@@ -272,10 +239,7 @@ mod tests {
         }
 
         fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String> {
-            let guard = self
-                .entries
-                .lock()
-                .map_err(|_| "state poisoned".to_string())?;
+            let guard = self.entries.lock().map_err(|_| "state poisoned".to_string())?;
             Ok(guard.iter().find(|entry| entry.uuid == uuid).cloned())
         }
     }
@@ -287,10 +251,7 @@ mod tests {
 
     impl Storage for TestStorage {
         fn append_entry(&self, entry: &Entry) -> Result<(), String> {
-            self.entries
-                .lock()
-                .map_err(|_| "storage poisoned".to_string())?
-                .push(entry.clone());
+            self.entries.lock().map_err(|_| "storage poisoned".to_string())?.push(entry.clone());
             Ok(())
         }
     }
@@ -302,10 +263,7 @@ mod tests {
 
     impl EventBus for TestBus {
         fn emit(&self, event: Event) -> Result<(), String> {
-            self.events
-                .lock()
-                .map_err(|_| "bus poisoned".to_string())?
-                .push(event);
+            self.events.lock().map_err(|_| "bus poisoned".to_string())?.push(event);
             Ok(())
         }
     }
@@ -454,8 +412,7 @@ mod tests {
     ) {
         let ingestor = ingestor(&state, &storage, &bus);
 
-        let response =
-            ingestor.handle(&serde_json::to_vec(&envelope_missing_screen).unwrap());
+        let response = ingestor.handle(&serde_json::to_vec(&envelope_missing_screen).unwrap());
         assert_eq!(response.status, 200);
 
         let stored = storage.entries.lock().unwrap();
@@ -463,11 +420,7 @@ mod tests {
     }
 
     #[rstest]
-    fn ingest_invalid_json_returns_400(
-        state: TestState,
-        storage: TestStorage,
-        bus: TestBus,
-    ) {
+    fn ingest_invalid_json_returns_400(state: TestState, storage: TestStorage, bus: TestBus) {
         let ingestor = ingestor(&state, &storage, &bus);
 
         let response = ingestor.handle(br#"{not valid json"#);
@@ -486,8 +439,7 @@ mod tests {
     ) {
         let ingestor = ingestor(&state, &storage, &bus);
 
-        let response =
-            ingestor.handle(&serde_json::to_vec(&envelope_missing_uuid).unwrap());
+        let response = ingestor.handle(&serde_json::to_vec(&envelope_missing_uuid).unwrap());
         assert_eq!(response.status, 422);
         assert!(state.entries.lock().unwrap().is_empty());
         assert!(storage.entries.lock().unwrap().is_empty());
