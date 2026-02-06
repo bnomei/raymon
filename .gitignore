@@ -19,6 +19,9 @@ benchmarks/results/
 # Codex app metadata
 .codex/
 
+# Raymon runtime data (entries, blobs, archives)
+/data/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

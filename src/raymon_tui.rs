@@ -664,11 +664,7 @@ impl Tui {
 
     fn main_areas(&self, area: Rect) -> (Rect, Rect, Option<Rect>) {
         let constraints = if self.state.show_archives {
-            vec![
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-            ]
+            vec![Constraint::Percentage(34), Constraint::Percentage(33), Constraint::Percentage(33)]
         } else {
             vec![Constraint::Percentage(50), Constraint::Percentage(50)]
         };
@@ -677,8 +673,7 @@ impl Tui {
         } else {
             Direction::Horizontal
         };
-        let chunks =
-            Layout::default().direction(direction).constraints(constraints).split(area);
+        let chunks = Layout::default().direction(direction).constraints(constraints).split(area);
 
         let logs = chunks[0];
         let detail = chunks[1];
@@ -816,7 +811,8 @@ impl Tui {
 
         // Prefer selecting the live archive if we have one.
         if let Some(live_path) = live_path.as_deref() {
-            if let Some(idx) = self.state.archives.iter().position(|entry| entry.path == live_path) {
+            if let Some(idx) = self.state.archives.iter().position(|entry| entry.path == live_path)
+            {
                 self.state.archive_selected = idx;
             }
         }
@@ -827,8 +823,7 @@ impl Tui {
     pub fn push_log(&mut self, entry: LogEntry) {
         self.record_event();
 
-        let follow_tail =
-            self.viewing_archive.is_none() && !self.state.paused && self.follow_tail;
+        let follow_tail = self.viewing_archive.is_none() && !self.state.paused && self.follow_tail;
 
         if !self.state.paused {
             self.append_to_live_archive(&entry);
@@ -944,18 +939,13 @@ impl Tui {
         };
 
         let color = entry.color.as_deref().and_then(|value| {
-            canonical_color_name(value)
-                .map(|value| value.to_string())
-                .or_else(|| {
-                    let normalized = normalize_label(value);
-                    (!normalized.is_empty()).then_some(normalized)
-                })
+            canonical_color_name(value).map(|value| value.to_string()).or_else(|| {
+                let normalized = normalize_label(value);
+                (!normalized.is_empty()).then_some(normalized)
+            })
         });
-        let entry_type = entry
-            .entry_type
-            .as_deref()
-            .map(normalize_label)
-            .filter(|value| !value.is_empty());
+        let entry_type =
+            entry.entry_type.as_deref().map(normalize_label).filter(|value| !value.is_empty());
 
         self.state.filters.colors.clear();
         self.state.filters.types.clear();
@@ -1036,8 +1026,7 @@ impl Tui {
         if self.state.show_help && self.state.picker.is_none() && self.state.mode == Mode::Normal {
             match key {
                 KeyEvent { code: KeyCode::Esc, .. }
-                | KeyEvent { code: KeyCode::Char('?'), modifiers: KeyModifiers::NONE, .. }
-                => {
+                | KeyEvent { code: KeyCode::Char('?'), modifiers: KeyModifiers::NONE, .. } => {
                     self.state.show_help = false;
                     return Action::None;
                 }
@@ -1185,16 +1174,16 @@ impl Tui {
                             logs_view_offset(self.state.selected, total, list_area.height as usize);
                         let next = offset.saturating_add(row);
 
-                if next < total {
-                    self.state.selected = next;
-                    self.follow_tail = self.state.selected.saturating_add(1) >= total;
-                    self.state.last_detail_search = None;
-                    self.state.detail_notice = None;
-                    self.state.detail_scroll = 0;
-                }
+                        if next < total {
+                            self.state.selected = next;
+                            self.follow_tail = self.state.selected.saturating_add(1) >= total;
+                            self.state.last_detail_search = None;
+                            self.state.detail_notice = None;
+                            self.state.detail_scroll = 0;
+                        }
 
-                return Action::None;
-            }
+                        return Action::None;
+                    }
                 }
 
                 if let Some(list_area) = self.archives_list_area(size) {
@@ -1346,9 +1335,7 @@ impl Tui {
         if self.modal_open() && !focused {
             self.base_style().fg(self.ansi_color(Ansi16::BrightBlack))
         } else if focused {
-            self.base_style()
-                .fg(self.ansi_color(Ansi16::Green))
-                .add_modifier(Modifier::BOLD)
+            self.base_style().fg(self.ansi_color(Ansi16::Green)).add_modifier(Modifier::BOLD)
         } else {
             self.base_style().add_modifier(Modifier::BOLD)
         }
@@ -1361,15 +1348,11 @@ impl Tui {
     }
 
     fn help_key_style(&self) -> Style {
-        self.base_style()
-            .fg(self.ansi_color(Ansi16::BrightBlue))
-            .add_modifier(Modifier::BOLD)
+        self.base_style().fg(self.ansi_color(Ansi16::BrightBlue)).add_modifier(Modifier::BOLD)
     }
 
     fn help_header_style(&self) -> Style {
-        self.base_style()
-            .fg(self.ansi_color(Ansi16::Green))
-            .add_modifier(Modifier::BOLD)
+        self.base_style().fg(self.ansi_color(Ansi16::Green)).add_modifier(Modifier::BOLD)
     }
 
     fn dimmed_style(&self) -> Style {
@@ -1377,10 +1360,8 @@ impl Tui {
     }
 
     fn json_syntax_highlight(&self, input: &str) -> Text<'static> {
-        let key_style = self
-            .base_style()
-            .fg(self.ansi_color(Ansi16::Cyan))
-            .add_modifier(Modifier::BOLD);
+        let key_style =
+            self.base_style().fg(self.ansi_color(Ansi16::Cyan)).add_modifier(Modifier::BOLD);
         let string_style = self.base_style().fg(self.ansi_color(Ansi16::Green));
         let number_style = self.base_style().fg(self.ansi_color(Ansi16::Magenta));
         let bool_style = self.base_style().fg(self.ansi_color(Ansi16::Yellow));
@@ -1472,11 +1453,8 @@ impl Tui {
         input.insert_str(&entry.name);
         input.cursor = input.buffer.len();
         self.state.delete_archive_confirm = None;
-        self.state.rename_archive = Some(RenameArchiveState {
-            path: entry.path.clone(),
-            input,
-            overwrite: true,
-        });
+        self.state.rename_archive =
+            Some(RenameArchiveState { path: entry.path.clone(), input, overwrite: true });
     }
 
     fn open_screen_picker(&mut self) {
@@ -1644,9 +1622,10 @@ impl Tui {
             }
         };
 
-        if let Some(_) = json_path_match(&parsed, query) {
-            self.state.last_detail_search = Some(DetailSearchResult::JsonPathMatch);
-            return DetailSearchResult::JsonPathMatch;
+        if let Some(result) = json_path_match(&parsed, query) {
+            let outcome = DetailSearchResult::JqMatch(result);
+            self.state.last_detail_search = Some(outcome.clone());
+            return outcome;
         }
 
         match self.run_jq(detail, query) {
@@ -1676,11 +1655,7 @@ impl Tui {
 
     fn handle_normal(&mut self, key: KeyEvent) -> Action {
         match key {
-            KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
+            KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::NONE, .. } => {
                 match self.state.focus {
                     FocusPane::Logs => self.move_selection(1),
                     FocusPane::Detail => self.scroll_detail_by(1),
@@ -1689,7 +1664,8 @@ impl Tui {
                 Action::None
             }
             KeyEvent { code: KeyCode::Char('J'), modifiers, .. }
-                if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.scroll_detail_by(1);
                 Action::None
@@ -1710,11 +1686,7 @@ impl Tui {
                 }
                 Action::None
             }
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => {
+            KeyEvent { code: KeyCode::Char('k'), modifiers: KeyModifiers::NONE, .. } => {
                 match self.state.focus {
                     FocusPane::Logs => self.move_selection(-1),
                     FocusPane::Detail => self.scroll_detail_by(-1),
@@ -1723,7 +1695,8 @@ impl Tui {
                 Action::None
             }
             KeyEvent { code: KeyCode::Char('K'), modifiers, .. }
-                if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.scroll_detail_by(-1);
                 Action::None
@@ -1854,7 +1827,8 @@ impl Tui {
                 Action::None
             }
             KeyEvent { code: KeyCode::Char('Z'), modifiers, .. }
-                if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.state.json_raw = !self.state.json_raw;
                 self.state.detail_scroll = 0;
@@ -1865,7 +1839,8 @@ impl Tui {
                 Action::None
             }
             KeyEvent { code: KeyCode::Char('Y'), modifiers, .. }
-                if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
             {
                 let _ = self.yank_selected(YankKind::Detail);
                 Action::None
@@ -2833,13 +2808,11 @@ impl Tui {
     }
 
     fn open_in_editor(&mut self) -> Result<PathBuf, TuiError> {
-        let entry = self.selected_entry().ok_or(TuiError::NoSelection)?;
+        if self.selected_entry().is_none() {
+            return Err(TuiError::NoSelection);
+        }
         let mut temp = NamedTempFile::new()?;
-        let detail = if let Ok(value) = serde_json::from_str::<Value>(&entry.detail) {
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| entry.detail.clone())
-        } else {
-            entry.detail.clone()
-        };
+        let (detail, _) = self.detail_text();
         temp.write_all(detail.as_bytes())?;
         let temp_path = temp.into_temp_path();
         let path_buf = temp_path.to_path_buf();
@@ -2935,9 +2908,7 @@ impl Tui {
         let run_inner = run_block.inner(run_area);
         frame.render_widget(run_block, run_area);
         frame.render_widget(
-            Paragraph::new(run_label)
-                .alignment(Alignment::Center)
-                .style(run_style),
+            Paragraph::new(run_label).alignment(Alignment::Center).style(run_style),
             run_inner,
         );
 
@@ -2956,9 +2927,7 @@ impl Tui {
         } else {
             "FUZ"
         };
-        let kind_style = self
-            .base_style()
-            .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        let kind_style = self.base_style().add_modifier(Modifier::REVERSED | Modifier::BOLD);
 
         let (query, query_active) = match self.state.mode {
             Mode::Command => (self.state.command.buffer.as_str(), true),
@@ -2994,9 +2963,7 @@ impl Tui {
         }
 
         frame.render_widget(
-            Paragraph::new(Line::from(spans))
-                .alignment(Alignment::Left)
-                .style(self.base_style()),
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Left).style(self.base_style()),
             inner,
         );
     }
@@ -3048,13 +3015,7 @@ impl Tui {
         let types = if self.state.filters.types.is_empty() {
             " ".to_string()
         } else {
-            self.state
-                .filters
-                .types
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
+            self.state.filters.types.iter().cloned().collect::<Vec<_>>().join(",")
         };
         spans.push(Span::raw(format!("[{types}]")));
         spans.push(Span::raw(" "));
@@ -3110,7 +3071,11 @@ impl Tui {
         let columns_line = Line::from(columns_spans).left_aligned();
         let bottom = if self.state.mode == Mode::Goto && self.state.focus == FocusPane::Logs {
             let cursor_style = self.base_style().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-            let display = if self.state.goto.buffer.is_empty() { " ".to_string() } else { self.state.goto.buffer.clone() };
+            let display = if self.state.goto.buffer.is_empty() {
+                " ".to_string()
+            } else {
+                self.state.goto.buffer.clone()
+            };
             Line::from(vec![
                 Span::raw("─ "),
                 Span::styled(display, cursor_style),
@@ -3231,12 +3196,22 @@ impl Tui {
             && !self.modal_open();
         let border_style = self.panel_border_style(focused);
         let title_style = self.panel_title_style(focused);
+        let transformed =
+            matches!(self.state.last_detail_search.as_ref(), Some(DetailSearchResult::JqMatch(_)));
         let uuid = self.selected_entry().map(|entry| entry.uuid.clone());
         let (display_stats, blob_stats, timestamp_iso) = {
             let cached = self.detail_cached();
             (cached.display_stats, cached.blob_stats, cached.timestamp_iso.clone())
         };
-        let mut title_spans: Vec<Span<'static>> = vec![Span::raw("─ Detail")];
+        let mut title_spans: Vec<Span<'static>> = vec![Span::raw("─ ")];
+        if transformed {
+            title_spans.push(Span::styled(
+                "Detail",
+                self.base_style().fg(self.ansi_color(Ansi16::Red)).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            title_spans.push(Span::raw("Detail"));
+        }
         if let Some(ts) = &timestamp_iso {
             title_spans.push(Span::raw(" "));
             title_spans.push(Span::styled(
@@ -3250,8 +3225,10 @@ impl Tui {
         }
         title_spans.push(Span::raw(" "));
         let title = Line::from(title_spans);
-        let bottom =
-            format!("─ {} lines · {} bytes · {} tok ─", blob_stats.lines, blob_stats.bytes, blob_stats.tokens);
+        let bottom = format!(
+            "─ {} lines · {} bytes · {} tok ─",
+            blob_stats.lines, blob_stats.bytes, blob_stats.tokens
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
@@ -3260,10 +3237,8 @@ impl Tui {
             .title_style(title_style);
         let inner = block.inner(area);
         self.state.detail_viewport_height = inner.height;
-        let max_scroll = display_stats
-            .lines
-            .saturating_sub(inner.height as usize)
-            .min(u16::MAX as usize) as u16;
+        let max_scroll =
+            display_stats.lines.saturating_sub(inner.height as usize).min(u16::MAX as usize) as u16;
         self.state.detail_scroll = self.state.detail_scroll.min(max_scroll);
         let scroll = self.state.detail_scroll;
         let cached = self.detail_cached();
@@ -3318,10 +3293,7 @@ impl Tui {
                 } else if active == Some(entry.path.as_path()) {
                     ("◼ ", Style::default().fg(self.ansi_color(Ansi16::Blue)))
                 } else {
-                    (
-                        "◻ ",
-                        Style::default().fg(self.ansi_color(Ansi16::BrightBlack)),
-                    )
+                    ("◻ ", Style::default().fg(self.ansi_color(Ansi16::BrightBlack)))
                 };
 
                 let line = Line::from(vec![
@@ -3383,13 +3355,12 @@ impl Tui {
                 spans.push(Span::styled(sep, sep_style));
             }
         };
-        let push_item =
-            |spans: &mut Vec<Span<'static>>, label: &'static str, key: &'static str| {
-                push_sep(spans);
-                spans.push(Span::styled(label, sep_style));
-                spans.push(Span::raw(":"));
-                spans.push(Span::styled(key, key_style));
-            };
+        let push_item = |spans: &mut Vec<Span<'static>>, label: &'static str, key: &'static str| {
+            push_sep(spans);
+            spans.push(Span::styled(label, sep_style));
+            spans.push(Span::raw(":"));
+            spans.push(Span::styled(key, key_style));
+        };
 
         if compact && !matches!(self.state.mode, Mode::Search | Mode::Command) {
             push_item(&mut spans, "Pause", "p");
@@ -3452,9 +3423,7 @@ impl Tui {
                 .constraints([Constraint::Min(0), Constraint::Length(brand_width)])
                 .split(footer_area);
             frame.render_widget(
-                Paragraph::new(left)
-                    .alignment(Alignment::Left)
-                    .style(sep_style),
+                Paragraph::new(left).alignment(Alignment::Left).style(sep_style),
                 chunks[0],
             );
             frame.render_widget(
@@ -3465,9 +3434,7 @@ impl Tui {
             );
         } else {
             frame.render_widget(
-                Paragraph::new(left)
-                    .alignment(Alignment::Left)
-                    .style(sep_style),
+                Paragraph::new(left).alignment(Alignment::Left).style(sep_style),
                 footer_area,
             );
         }
@@ -3564,10 +3531,8 @@ impl Tui {
             .title_style(self.panel_title_style(true));
         let inner = block.inner(area);
         self.state.help_viewport_height = inner.height;
-        let max_scroll = text
-            .len()
-            .saturating_sub(inner.height.max(1) as usize)
-            .min(u16::MAX as usize) as u16;
+        let max_scroll =
+            text.len().saturating_sub(inner.height.max(1) as usize).min(u16::MAX as usize) as u16;
         self.state.help_scroll = self.state.help_scroll.min(max_scroll);
         let paragraph = Paragraph::new(text)
             .block(block)
@@ -3639,12 +3604,8 @@ impl Tui {
         };
 
         let name = archive_display_name(path);
-        let count = self
-            .state
-            .archives
-            .iter()
-            .find(|entry| entry.path == path)
-            .map(|entry| entry.count);
+        let count =
+            self.state.archives.iter().find(|entry| entry.path == path).map(|entry| entry.count);
 
         let area = centered_rect(55, 22, frame.area());
         frame.render_widget(Clear, area);
@@ -3662,7 +3623,11 @@ impl Tui {
         let dim_style = self.dimmed_style();
 
         let mut text = Vec::new();
-        let mut first = vec![Span::raw("Delete "), Span::styled(name, self.base_style().add_modifier(Modifier::BOLD)), Span::raw("?")];
+        let mut first = vec![
+            Span::raw("Delete "),
+            Span::styled(name, self.base_style().add_modifier(Modifier::BOLD)),
+            Span::raw("?"),
+        ];
         if let Some(count) = count {
             first.push(Span::styled(format!(" ({count})"), dim_style));
         }
@@ -3741,7 +3706,10 @@ impl Tui {
                     }
                     if matches!(picker.kind, PickerKind::Colors) {
                         if let Some(color) = self.color_from_name(&item.label) {
-                            spans.push(Span::styled(item.label.clone(), self.base_style().fg(color)));
+                            spans.push(Span::styled(
+                                item.label.clone(),
+                                self.base_style().fg(color),
+                            ));
                         } else {
                             spans.push(Span::raw(item.label.clone()));
                         }
@@ -3817,11 +3785,8 @@ impl Tui {
 
         if needs_refresh {
             let (text, is_json) = self.detail_text();
-            let render = if is_json {
-                self.json_syntax_highlight(&text)
-            } else {
-                Text::from(text.clone())
-            };
+            let render =
+                if is_json { self.json_syntax_highlight(&text) } else { Text::from(text.clone()) };
             let display_stats = detail_stats_for_text(&text);
             let blob_text = self.detail_blob_text();
             let blob_stats = detail_stats_for_text(&blob_text);
@@ -3925,10 +3890,7 @@ impl Tui {
                 self.state.logs.get(*idx).is_some_and(|entry| {
                     regex.is_match(&entry.message)
                         || entry.origin.as_deref().is_some_and(|origin| regex.is_match(origin))
-                        || entry
-                            .origin_file
-                            .as_deref()
-                            .is_some_and(|file| regex.is_match(file))
+                        || entry.origin_file.as_deref().is_some_and(|file| regex.is_match(file))
                         || regex.is_match(&entry.uuid)
                 })
             })
@@ -3939,9 +3901,7 @@ impl Tui {
         let query_lower = query.to_lowercase();
         let threshold = if query_lower.len() <= 2 { 0.2 } else { 0.35 };
         let query_trimmed = query_lower.trim_start_matches('/');
-        let path_like_query = query_lower
-            .chars()
-            .any(|ch| matches!(ch, '/' | '\\' | '.' | ':'));
+        let path_like_query = query_lower.chars().any(|ch| matches!(ch, '/' | '\\' | '.' | ':'));
         #[cfg(feature = "rayon")]
         let use_parallel = indices.len() >= 200;
         let candidates: Vec<(usize, String, Option<String>, String)> = indices
@@ -3959,31 +3919,39 @@ impl Tui {
             })
             .collect();
 
-        let score_entry =
-            |(idx, message_lower, origin_lower, uuid_lower): &(usize, String, Option<String>, String)| {
-                let contains = |haystack: &str| {
-                    haystack.contains(&query_lower)
-                        || (!query_trimmed.is_empty() && haystack.contains(query_trimmed))
-                };
-
-                if contains(message_lower)
-                    || origin_lower.as_ref().is_some_and(|origin| contains(origin))
-                    || contains(uuid_lower)
-                {
-                    return Some((*idx, 1.0));
-                }
-
-                if path_like_query {
-                    return None;
-                }
-
-                let mut best = fuzz::ratio(query_lower.chars(), message_lower.chars());
-                if let Some(origin) = origin_lower.as_ref() {
-                    best = best.max(fuzz::ratio(query_lower.chars(), origin.chars()));
-                }
-
-                if best >= threshold { Some((*idx, best)) } else { None }
+        let score_entry = |(idx, message_lower, origin_lower, uuid_lower): &(
+            usize,
+            String,
+            Option<String>,
+            String,
+        )| {
+            let contains = |haystack: &str| {
+                haystack.contains(&query_lower)
+                    || (!query_trimmed.is_empty() && haystack.contains(query_trimmed))
             };
+
+            if contains(message_lower)
+                || origin_lower.as_ref().is_some_and(|origin| contains(origin))
+                || contains(uuid_lower)
+            {
+                return Some((*idx, 1.0));
+            }
+
+            if path_like_query {
+                return None;
+            }
+
+            let mut best = fuzz::ratio(query_lower.chars(), message_lower.chars());
+            if let Some(origin) = origin_lower.as_ref() {
+                best = best.max(fuzz::ratio(query_lower.chars(), origin.chars()));
+            }
+
+            if best >= threshold {
+                Some((*idx, best))
+            } else {
+                None
+            }
+        };
 
         let mut scored: Vec<(usize, f64)> = {
             #[cfg(feature = "rayon")]
@@ -4256,13 +4224,13 @@ fn archive_stamp(now: DateTime<Utc>) -> String {
 }
 
 fn archive_display_name(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("archive")
-        .to_string()
+    path.file_stem().and_then(|value| value.to_str()).unwrap_or("archive").to_string()
 }
 
-fn create_unique_jsonl_file(dir: &Path, base_name: &str) -> Result<(PathBuf, std::fs::File), std::io::Error> {
+fn create_unique_jsonl_file(
+    dir: &Path,
+    base_name: &str,
+) -> Result<(PathBuf, std::fs::File), std::io::Error> {
     for attempt in 0..=999u16 {
         let filename = if attempt == 0 {
             format!("{base_name}.jsonl")
@@ -4276,10 +4244,7 @@ fn create_unique_jsonl_file(dir: &Path, base_name: &str) -> Result<(PathBuf, std
             Err(err) => return Err(err),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "archive file already exists",
-    ))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "archive file already exists"))
 }
 
 fn scan_archives(dir: &Path, live_path: Option<&Path>) -> Result<Vec<ArchiveFile>, std::io::Error> {
@@ -4672,7 +4637,17 @@ fn json_path_match(value: &Value, query: &str) -> Option<String> {
             current = current.get(segment)?;
         }
     }
-    Some(current.to_string())
+    Some(json_path_render(current))
+}
+
+fn json_path_render(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        other => other.to_string(),
+    }
 }
 
 impl fmt::Debug for Tui {
@@ -5190,10 +5165,7 @@ mod tests {
         let segments = json_highlight_segments(json);
 
         let kind_for = |token: &str| {
-            segments
-                .iter()
-                .find(|(_, segment)| *segment == token)
-                .map(|(kind, _)| *kind)
+            segments.iter().find(|(_, segment)| *segment == token).map(|(kind, _)| *kind)
         };
 
         assert_eq!(kind_for(r#""foo""#), Some(JsonHighlightKind::Key));
@@ -5486,10 +5458,7 @@ mod tests {
         assert_eq!(tui.state.logs.len(), 1);
 
         tui.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
-        assert_eq!(
-            tui.state.delete_archive_confirm.as_deref(),
-            Some(archive_path.as_path())
-        );
+        assert_eq!(tui.state.delete_archive_confirm.as_deref(), Some(archive_path.as_path()));
         tui.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(tui.state.delete_archive_confirm.is_none());
@@ -5566,10 +5535,7 @@ mod tests {
             Some(archive_path.as_path())
         );
         assert_eq!(
-            tui.state
-                .rename_archive
-                .as_ref()
-                .map(|rename| rename.input.buffer.as_str()),
+            tui.state.rename_archive.as_ref().map(|rename| rename.input.buffer.as_str()),
             Some("old-session")
         );
 
@@ -5584,12 +5550,13 @@ mod tests {
         assert!(tui.state.rename_archive.is_none());
         assert_eq!(tui.viewing_archive.as_deref(), Some(new_path.as_path()));
         assert_eq!(tui.state.logs.len(), 1);
-        assert!(tui.state.archives.iter().any(|entry| entry.path == new_path && entry.name == "renamed"));
-        let selected_path = tui
+        assert!(tui
             .state
             .archives
-            .get(tui.state.archive_selected)
-            .map(|entry| entry.path.clone());
+            .iter()
+            .any(|entry| entry.path == new_path && entry.name == "renamed"));
+        let selected_path =
+            tui.state.archives.get(tui.state.archive_selected).map(|entry| entry.path.clone());
         assert_eq!(selected_path.as_deref(), Some(new_path.as_path()));
     }
 

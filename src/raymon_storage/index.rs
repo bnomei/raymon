@@ -269,16 +269,15 @@ impl IndexRecord {
         }
 
         if !filters.colors.is_empty() {
-            let normalized: Vec<&str> = filters
-                .colors
-                .iter()
-                .filter_map(|value| canonical_color_name(value))
-                .collect();
+            let normalized: Vec<&str> =
+                filters.colors.iter().filter_map(|value| canonical_color_name(value)).collect();
             if normalized.is_empty() {
                 return false;
             }
             if self.colors.is_empty()
-                || !normalized.iter().any(|filter_color| self.colors.iter().any(|value| value == filter_color))
+                || !normalized
+                    .iter()
+                    .any(|filter_color| self.colors.iter().any(|value| value == filter_color))
             {
                 return false;
             }

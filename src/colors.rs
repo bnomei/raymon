@@ -24,4 +24,3 @@ pub fn canonical_color_name(value: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-

@@ -12,20 +12,16 @@ use std::{
     time::Duration,
 };
 
+use crate::colors::canonical_color_name;
 use crate::raymon_core::{
     Entry as CoreEntry, Event as CoreEvent, EventBus as CoreEventBusTrait, Filters, RayEnvelope,
     RayMeta, RayOrigin, RayPayload, Screen, StateStore as CoreStateStoreTrait,
 };
-use crate::colors::canonical_color_name;
 use crate::raymon_ingest::Ingestor;
 use crate::raymon_mcp::{RaymonMcp, RaymonMcpService};
 use crate::raymon_storage::{
-    EntryInput,
-    EntryPayload as StoragePayload,
-    Storage as RaymonStorage,
-    StoredEntry,
-    StoredPayload,
-    ENTRIES_FILE,
+    EntryInput, EntryPayload as StoragePayload, Storage as RaymonStorage, StoredEntry,
+    StoredPayload, ENTRIES_FILE,
 };
 use crate::raymon_tui::{Action, LogEntry, Tui, TuiConfig, TuiPalette};
 use axum::{
@@ -40,13 +36,14 @@ use axum::{
     routing::post,
     Router,
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use rmcp::ServiceExt as McpServiceExt;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
@@ -79,24 +76,32 @@ enum UiEvent {
 #[derive(Parser, Debug)]
 #[command(name = "raymon", version, about = "Raymon CLI")]
 struct Cli {
-    #[arg(long)]
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+    #[arg(long, global = true)]
     host: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     port: Option<u16>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     ide: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     editor: Option<String>,
-    #[arg(long)]
+    #[arg(long, global = true)]
     jq: Option<String>,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue, global = true)]
     tui: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue, global = true)]
     no_tui: bool,
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue, global = true)]
     demo: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum CliCommand {
+    /// Run as an MCP server over stdio (no TUI)
+    Mcp,
 }
 
 #[derive(Debug, Clone)]
@@ -531,11 +536,9 @@ fn restore_from_storage(
         let is_first = seen.insert(core_entry.uuid.clone());
 
         if is_first {
-            core.insert(core_entry)
-                .map_err(|error| -> DynError { Box::new(error) })?;
+            core.insert(core_entry).map_err(|error| -> DynError { Box::new(error) })?;
         } else {
-            core.update(core_entry)
-                .map_err(|error| -> DynError { Box::new(error) })?;
+            core.update(core_entry).map_err(|error| -> DynError { Box::new(error) })?;
         }
 
         if let Some(log_entry) = log_entry {
@@ -558,18 +561,14 @@ fn restore_from_storage(
     Ok(logs)
 }
 
-fn build_state(storage_root: &Path, collect_logs: bool) -> Result<(AppState, Vec<LogEntry>), DynError> {
+fn build_state(
+    storage_root: &Path,
+    collect_logs: bool,
+) -> Result<(AppState, Vec<LogEntry>), DynError> {
     let storage = RaymonStorage::new(storage_root)?;
     let core = CoreState::default();
     let logs = restore_from_storage(&core, &storage, collect_logs)?;
-    Ok((
-        AppState {
-            core,
-            storage: StorageHandle::new(storage),
-            bus: CoreBus::new(),
-        },
-        logs,
-    ))
+    Ok((AppState { core, storage: StorageHandle::new(storage), bus: CoreBus::new() }, logs))
 }
 
 fn entry_to_storage_input(entry: &CoreEntry) -> Result<EntryInput, String> {
@@ -708,25 +707,8 @@ fn log_id(uuid: &str) -> u64 {
 }
 
 fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
-    let fallback = entry.payloads.first().map(|payload| payload.r#type.as_str()).unwrap_or("entry");
-    let message = entry
-        .payloads
-        .first()
-        .and_then(|payload| payload.content.get("message"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(fallback);
-    let detail_value = extract_entry_detail_value(entry);
-    let detail = match detail_value {
-        Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()),
-        None => {
-            let contents: Vec<&Value> =
-                entry.payloads.iter().map(|payload| &payload.content).collect();
-            match contents.as_slice() {
-                [only] => serde_json::to_string(only).unwrap_or_else(|_| only.to_string()),
-                _ => serde_json::to_string(&contents).unwrap_or_else(|_| format!("{entry:?}")),
-            }
-        }
-    };
+    let message = entry_list_label(entry);
+    let detail = entry_detail(entry);
     let (origin_file, origin_line) = entry
         .payloads
         .first()
@@ -754,7 +736,7 @@ fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
     LogEntry {
         id: log_id(&entry.uuid),
         uuid: entry.uuid.clone(),
-        message: truncate(message, SUMMARY_LIMIT),
+        message: truncate(&message, SUMMARY_LIMIT),
         detail,
         origin,
         origin_file,
@@ -766,30 +748,230 @@ fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
     }
 }
 
-fn extract_entry_detail_value(entry: &CoreEntry) -> Option<Value> {
-    let mut values: Vec<Value> =
-        entry.payloads.iter().filter_map(|payload| payload.content.get("data").cloned()).collect();
+fn entry_list_label(entry: &CoreEntry) -> String {
+    entry.payloads.first().map(payload_list_label).unwrap_or_else(|| "entry".to_string())
+}
 
-    if values.is_empty() {
-        return None;
+fn payload_list_label(payload: &crate::raymon_core::Payload) -> String {
+    if let Some(message) = payload.content.get("message").and_then(|value| value.as_str()) {
+        return message.to_string();
     }
 
-    if values.len() == 1 {
-        return values.pop();
+    match payload.r#type.as_str() {
+        "log" => {
+            let Some(values) = payload.content.get("values") else {
+                return "log".to_string();
+            };
+            let Value::Array(items) = values else {
+                return "log".to_string();
+            };
+            let Some(first) = items.first() else {
+                return "log".to_string();
+            };
+            let first_value = match first {
+                Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            let extra = items.len().saturating_sub(1);
+            if extra == 0 {
+                return first_value;
+            }
+            format!("{first_value} (+{extra})")
+        }
+        "table" => payload
+            .content
+            .get("label")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("table")
+            .to_string(),
+        "json_string" => "JSON".to_string(),
+        "custom" => {
+            let label = payload.content.get("label").and_then(|value| value.as_str()).unwrap_or("");
+            if !label.trim().is_empty() {
+                return label.to_string();
+            }
+            if matches!(
+                payload.content.get("content"),
+                Some(Value::Object(_)) | Some(Value::Array(_))
+            ) {
+                return "JSON".to_string();
+            }
+            "custom".to_string()
+        }
+        _ => payload.r#type.clone(),
     }
+}
 
-    let all_arrays = values.iter().all(|value| matches!(value, Value::Array(_)));
-    if all_arrays {
-        let mut flattened = Vec::new();
-        for value in values {
-            if let Value::Array(items) = value {
-                flattened.extend(items);
+#[derive(Debug, Clone)]
+enum EntryDetail {
+    Text(String),
+    Json(Value),
+}
+
+fn entry_detail(entry: &CoreEntry) -> String {
+    match extract_entry_detail(entry) {
+        Some(EntryDetail::Text(text)) => text,
+        Some(EntryDetail::Json(value)) => {
+            serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+        }
+        None => {
+            let contents: Vec<&Value> =
+                entry.payloads.iter().map(|payload| &payload.content).collect();
+            match contents.as_slice() {
+                [only] => serde_json::to_string(only).unwrap_or_else(|_| only.to_string()),
+                _ => serde_json::to_string(&contents).unwrap_or_else(|_| format!("{entry:?}")),
             }
         }
-        return Some(Value::Array(flattened));
+    }
+}
+
+fn extract_entry_detail(entry: &CoreEntry) -> Option<EntryDetail> {
+    let mut bodies = Vec::new();
+    for payload in &entry.payloads {
+        if let Some(body) = extract_payload_body(payload) {
+            bodies.push(body);
+        }
     }
 
-    Some(Value::Array(values))
+    match bodies.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        many => {
+            let all_text = many.iter().all(|item| matches!(item, EntryDetail::Text(_)));
+            if all_text {
+                let joined = many
+                    .iter()
+                    .filter_map(|item| match item {
+                        EntryDetail::Text(text) => Some(text.as_str()),
+                        EntryDetail::Json(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                return Some(EntryDetail::Text(joined));
+            }
+
+            let mut values = Vec::with_capacity(many.len());
+            let mut all_arrays = true;
+            for item in many {
+                match item {
+                    EntryDetail::Text(text) => {
+                        all_arrays = false;
+                        values.push(Value::String(text.clone()));
+                    }
+                    EntryDetail::Json(value) => {
+                        all_arrays &= matches!(value, Value::Array(_));
+                        values.push(value.clone());
+                    }
+                }
+            }
+
+            if all_arrays {
+                let mut flattened = Vec::new();
+                for value in values {
+                    if let Value::Array(items) = value {
+                        flattened.extend(items);
+                    }
+                }
+                return Some(EntryDetail::Json(Value::Array(flattened)));
+            }
+
+            Some(EntryDetail::Json(Value::Array(values)))
+        }
+    }
+}
+
+fn extract_payload_body(payload: &crate::raymon_core::Payload) -> Option<EntryDetail> {
+    if let Some(value) = payload.content.get("data") {
+        return Some(value_to_detail(value, None));
+    }
+
+    match payload.r#type.as_str() {
+        "log" => match payload.content.get("values") {
+            Some(Value::Array(items)) if items.len() == 1 => {
+                items.first().map(|value| value_to_detail(value, None))
+            }
+            Some(Value::Array(items)) => Some(EntryDetail::Json(Value::Array(items.clone()))),
+            Some(other) => Some(value_to_detail(other, None)),
+            None => extract_payload_body_fallback(payload),
+        },
+        "table" => match payload.content.get("values") {
+            Some(values) => Some(value_to_detail(values, None)),
+            None => extract_payload_body_fallback(payload),
+        },
+        "json_string" => match payload.content.get("value") {
+            Some(Value::String(serialized)) => {
+                let parsed = serde_json::from_str::<Value>(serialized)
+                    .unwrap_or(Value::String(serialized.clone()));
+                Some(value_to_detail(&parsed, None))
+            }
+            Some(other) => Some(value_to_detail(other, None)),
+            None => extract_payload_body_fallback(payload),
+        },
+        "custom" => {
+            let label = payload.content.get("label").and_then(|value| value.as_str());
+            match payload.content.get("content") {
+                Some(Value::String(text)) => {
+                    let formatted =
+                        if label == Some("Text") { decode_ray_text(text) } else { text.clone() };
+                    Some(EntryDetail::Text(formatted))
+                }
+                Some(other) => Some(value_to_detail(other, label)),
+                None => extract_payload_body_fallback(payload),
+            }
+        }
+        _ => extract_payload_body_fallback(payload),
+    }
+}
+
+fn extract_payload_body_fallback(payload: &crate::raymon_core::Payload) -> Option<EntryDetail> {
+    if let Some(stripped) = strip_envelope_fields(&payload.content) {
+        return Some(value_to_detail(&stripped, None));
+    }
+
+    if let Some(message) = payload.content.get("message").and_then(|value| value.as_str()) {
+        return Some(EntryDetail::Text(message.to_string()));
+    }
+
+    Some(value_to_detail(&payload.content, None))
+}
+
+fn strip_envelope_fields(value: &Value) -> Option<Value> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+
+    let mut filtered = serde_json::Map::new();
+    for (key, value) in map {
+        match key.as_str() {
+            "message" | "tags" | "color" | "seq" | "label" => {}
+            _ => {
+                filtered.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(Value::Object(filtered))
+    }
+}
+
+fn value_to_detail(value: &Value, _label: Option<&str>) -> EntryDetail {
+    match value {
+        Value::String(text) => EntryDetail::Text(text.clone()),
+        other => EntryDetail::Json(other.clone()),
+    }
+}
+
+fn decode_ray_text(input: &str) -> String {
+    let mut text = input.replace("&nbsp;", " ");
+    text = text.replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n");
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"");
+    text = text.replace("&#039;", "'").replace("&apos;", "'");
+    text = text.replace("&amp;", "&");
+    text
 }
 
 fn cli_overrides(cli: &Cli) -> PartialConfig {
@@ -984,6 +1166,64 @@ fn storage_root(cwd: &Path, config_path: Option<&PathBuf>) -> PathBuf {
     config_path.and_then(|path| path.parent()).unwrap_or(cwd).to_path_buf()
 }
 
+async fn run_mcp_stdio(
+    core: CoreState,
+    bus: CoreBus,
+    mut shutdown: broadcast::Receiver<()>,
+    shutdown_tx: broadcast::Sender<()>,
+    max_query_len: usize,
+) -> Result<(), DynError> {
+    let handler =
+        RaymonMcp::new_with_shutdown_and_limits(core, bus, shutdown_tx.clone(), max_query_len);
+    handler.start_event_forwarder().map_err(|error| -> DynError { error.to_string().into() })?;
+
+    let service = tokio::select! {
+        _ = shutdown.recv() => {
+            return Ok(());
+        }
+        service = handler.serve(rmcp::transport::stdio()) => {
+            service?
+        }
+    };
+    let mut service_ct = Some(service.cancellation_token());
+
+    let mut waiting_handle = tokio::spawn(async move { service.waiting().await });
+
+    tokio::select! {
+        _ = shutdown.recv() => {
+            if let Some(ct) = service_ct.take() {
+                ct.cancel();
+            }
+        }
+        result = &mut waiting_handle => {
+            let _ = shutdown_tx.send(());
+            mcp_wait_result(result)?;
+            return Ok(());
+        }
+    }
+
+    let result = waiting_handle.await;
+    mcp_wait_result(result)?;
+    Ok(())
+}
+
+fn mcp_wait_result(
+    result: Result<
+        Result<rmcp::service::QuitReason, tokio::task::JoinError>,
+        tokio::task::JoinError,
+    >,
+) -> Result<rmcp::service::QuitReason, DynError> {
+    let reason = match result {
+        Ok(Ok(reason)) => reason,
+        Ok(Err(error)) | Err(error) => return Err(Box::new(error)),
+    };
+
+    match reason {
+        rmcp::service::QuitReason::Cancelled | rmcp::service::QuitReason::Closed => Ok(reason),
+        rmcp::service::QuitReason::JoinError(error) => Err(Box::new(error)),
+    }
+}
+
 async fn run_server(
     config: Config,
     state: AppState,
@@ -1070,8 +1310,10 @@ async fn run_tui(
         running_signal.store(false, Ordering::SeqCst);
     });
 
-    tokio::task::spawn_blocking(move || run_tui_loop(config, log_rx, running, shutdown_tx, pause_tx))
-        .await??;
+    tokio::task::spawn_blocking(move || {
+        run_tui_loop(config, log_rx, running, shutdown_tx, pause_tx)
+    })
+    .await??;
 
     forward_handle.abort();
     shutdown_handle.abort();
@@ -1173,8 +1415,10 @@ fn run_tui_loop(
                                 }
                                 Err(error) => {
                                     warn!(error = %error, "tui terminal suspend failed");
-                                    tui.state.detail_notice =
-                                        Some("failed to suspend terminal for external command".to_string());
+                                    tui.state.detail_notice = Some(
+                                        "failed to suspend terminal for external command"
+                                            .to_string(),
+                                    );
                                 }
                             }
                         } else if let Err(error) = tui.perform_action(action) {
@@ -1217,7 +1461,9 @@ impl<'a> TerminalSuspendGuard<'a> {
     fn new(terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<Self, DynError> {
         terminal.show_cursor()?;
         disable_raw_mode()?;
-        if let Err(error) = execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen) {
+        if let Err(error) =
+            execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)
+        {
             let _ = enable_raw_mode();
             let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture);
             let _ = terminal.hide_cursor();
@@ -1700,7 +1946,12 @@ pub async fn run() -> Result<(), DynError> {
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
     let env_map: BTreeMap<String, String> = env::vars().collect();
-    let (config, config_path) = resolve_config(&cli, &cwd, &env_map)?;
+    let (mut config, config_path) = resolve_config(&cli, &cwd, &env_map)?;
+    let mcp_stdio = matches!(cli.command, Some(CliCommand::Mcp));
+    if mcp_stdio {
+        // MCP stdio uses stdout for the protocol, so we can't run the TUI.
+        config.tui_enabled = false;
+    }
 
     if let Some(path) = &config_path {
         info!(path = %path.display(), "loaded config file");
@@ -1710,6 +1961,7 @@ pub async fn run() -> Result<(), DynError> {
 
     info!(
         enabled = config.enabled,
+        mode = if mcp_stdio { "mcp-stdio" } else { "default" },
         host = %config.host,
         port = config.port,
         tui_enabled = config.tui_enabled,
@@ -1759,18 +2011,66 @@ pub async fn run() -> Result<(), DynError> {
         shutdown_tx.clone(),
     ));
 
+    if mcp_stdio {
+        let mut mcp_handle = tokio::spawn(run_mcp_stdio(
+            state.core.clone(),
+            state.bus.clone(),
+            shutdown_tx.subscribe(),
+            shutdown_tx.clone(),
+            config.max_query_len,
+        ));
+
+        let mut server_result: Option<Result<(), DynError>> = None;
+        let mut mcp_result: Option<Result<(), DynError>> = None;
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                let _ = shutdown_tx.send(());
+            }
+            _ = shutdown_rx.recv() => {}
+            res = &mut server_handle => {
+                server_result = Some(res?);
+                let _ = shutdown_tx.send(());
+            }
+            res = &mut mcp_handle => {
+                mcp_result = Some(res?);
+                let _ = shutdown_tx.send(());
+            }
+        }
+
+        // Ensure every component sees the shutdown signal (idempotent).
+        let _ = shutdown_tx.send(());
+
+        let mcp_result = match mcp_result {
+            Some(result) => result,
+            None => mcp_handle.await?,
+        };
+        let server_result = match server_result {
+            Some(result) => result,
+            None => server_handle.await?,
+        };
+
+        if let Some(handle) = demo_handle {
+            let _ = handle.await;
+        }
+
+        mcp_result?;
+        server_result?;
+        return Ok(());
+    }
+
     let tui_handle = if config.tui_enabled {
         let palette = tui_palette_override(&env_map)?;
-	        let tui_config = TuiConfig {
-	            editor_command: config.editor.clone(),
-	            ide_command: config.ide.clone(),
-	            jq_command: config.jq.clone(),
-	            palette,
-	            show_archives_by_default: false,
-	            archive_dir: Some(storage_root.join("data").join("archives")),
-	            max_query_len: config.max_query_len,
-	            jq_timeout_ms: config.jq_timeout_ms,
-	        };
+        let tui_config = TuiConfig {
+            editor_command: config.editor.clone(),
+            ide_command: config.ide.clone(),
+            jq_command: config.jq.clone(),
+            palette,
+            show_archives_by_default: false,
+            archive_dir: Some(storage_root.join("data").join("archives")),
+            max_query_len: config.max_query_len,
+            jq_timeout_ms: config.jq_timeout_ms,
+        };
         Some(tokio::spawn(run_tui(
             tui_config,
             state.bus.clone(),
@@ -1851,6 +2151,7 @@ pub async fn run() -> Result<(), DynError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
 
     #[test]
@@ -1872,6 +2173,7 @@ mod tests {
             "--no-tui",
         ]);
 
+        assert!(cli.command.is_none());
         assert_eq!(cli.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(cli.port, Some(9999));
         assert_eq!(cli.config.as_deref(), Some(Path::new("config.json")));
@@ -1881,6 +2183,15 @@ mod tests {
         assert!(!cli.tui);
         assert!(cli.no_tui);
         assert!(!cli.demo);
+    }
+
+    #[test]
+    fn cli_parses_mcp_subcommand() {
+        let cli = Cli::parse_from(["raymon", "mcp", "--host", "127.0.0.1", "--demo"]);
+
+        assert!(matches!(cli.command, Some(CliCommand::Mcp)));
+        assert_eq!(cli.host.as_deref(), Some("127.0.0.1"));
+        assert!(cli.demo);
     }
 
     #[test]
@@ -1908,6 +2219,7 @@ mod tests {
         env_map.insert("RAYMON_NO_TUI".to_string(), "1".to_string());
 
         let cli = Cli {
+            command: None,
             host: Some("0.0.0.0".to_string()),
             port: None,
             config: None,
@@ -2056,5 +2368,108 @@ mod tests {
         assert!(restored.is_some());
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].message, "hello");
+    }
+
+    fn core_entry_with_payload(payload_type: &str, content: Value) -> CoreEntry {
+        let screen = Screen::new("proj:host:default");
+        CoreEntry {
+            uuid: "entry-1".to_string(),
+            received_at: 1,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: payload_type.to_string(),
+                content,
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn detail_shows_custom_payload_body_only() {
+        let entry = core_entry_with_payload(
+            "custom",
+            json!({ "content": "<em>hello world!</em>", "label": "HTML" }),
+        );
+        let log = log_entry_from_core(&entry);
+        assert_eq!(log.message, "HTML");
+        assert_eq!(log.detail, "<em>hello world!</em>");
+    }
+
+    #[test]
+    fn detail_decodes_text_custom_payload() {
+        let entry = core_entry_with_payload(
+            "custom",
+            json!({ "content": "Hello&nbsp;World<br>Line&nbsp;2&nbsp;&amp;&nbsp;3", "label": "Text" }),
+        );
+        let log = log_entry_from_core(&entry);
+        assert_eq!(log.message, "Text");
+        assert_eq!(log.detail, "Hello World\nLine 2 & 3");
+    }
+
+    #[test]
+    fn detail_parses_json_string_payload_value() {
+        let entry = core_entry_with_payload("json_string", json!({ "value": "{\"foo\": 1}" }));
+        let log = log_entry_from_core(&entry);
+        assert_eq!(log.message, "JSON");
+
+        let detail: Value = serde_json::from_str(&log.detail).expect("detail json");
+        assert_eq!(detail, json!({ "foo": 1 }));
+    }
+
+    #[test]
+    fn ray_log_payload_uses_values_for_message_and_detail() {
+        let entry =
+            core_entry_with_payload("log", json!({ "values": ["alpha", "beta"], "meta": [] }));
+        let log = log_entry_from_core(&entry);
+        assert_eq!(log.message, "alpha (+1)");
+
+        let detail: Value = serde_json::from_str(&log.detail).expect("detail json");
+        assert_eq!(detail, json!(["alpha", "beta"]));
+    }
+
+    #[test]
+    fn internal_log_payload_detail_is_message_only() {
+        let entry = core_entry_with_payload(
+            "log",
+            json!({ "message": "hello", "tags": ["demo"], "seq": 1 }),
+        );
+        let log = log_entry_from_core(&entry);
+        assert_eq!(log.message, "hello");
+        assert_eq!(log.detail, "hello");
+    }
+
+    #[test]
+    fn detail_strips_envelope_fields_when_no_explicit_data() {
+        let entry = core_entry_with_payload(
+            "http",
+            json!({
+                "message": "GET /api -> 200 (7ms)",
+                "color": "green",
+                "tags": ["demo", "http"],
+                "method": "GET",
+                "path": "/api",
+                "status": 200,
+                "duration_ms": 7
+            }),
+        );
+        let log = log_entry_from_core(&entry);
+        assert_eq!(log.message, "GET /api -> 200 (7ms)");
+
+        let detail: Value = serde_json::from_str(&log.detail).expect("detail json");
+        assert_eq!(
+            detail,
+            json!({ "method": "GET", "path": "/api", "status": 200, "duration_ms": 7 })
+        );
     }
 }

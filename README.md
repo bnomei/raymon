@@ -13,61 +13,83 @@ Raymon is:
 
 ## Quickstart
 
-Run Raymon (dev):
+Run Raymon:
 
 ```bash
-cargo run
+raymon
 ```
 
 Run Raymon on the Ray default port (handy if your Ray client defaults to `23517`):
 
 ```bash
-RAYMON_PORT=23517 cargo run
+RAYMON_PORT=23517 raymon
 ```
 
 Headless mode (no TUI):
 
 ```bash
-RAYMON_NO_TUI=1 cargo run
+RAYMON_NO_TUI=1 raymon
 ```
 
 Demo mode (self-generates events):
 
 ```bash
-cargo run -- --demo
+raymon --demo
 ```
 
 ### MCP Client Setup (Agents)
 
-Raymon exposes an MCP **Streamable HTTP** endpoint at `http://127.0.0.1:7777/mcp` by default.
+Raymon supports MCP over:
+- **stdio (local)** via `raymon mcp`
+- **Streamable HTTP (remote)** via `http://<host>:<port>/mcp` (default: `http://127.0.0.1:7777/mcp`)
 
-1) Start Raymon (keep it running):
-```bash
-cargo run
-```
+#### Local (stdio)
 
-2) Add it to your MCP client:
+In stdio mode, Raymon still starts the HTTP ingest endpoint on `RAYMON_HOST`/`RAYMON_PORT`
+(default `127.0.0.1:7777`), but MCP runs over stdio for your MCP client.
+This mode runs without the TUI (stdout is reserved for MCP).
+
+Add it to your MCP client:
 ```bash
 # Codex CLI
-codex mcp add raymon --url http://127.0.0.1:7777/mcp
+codex mcp add raymon -- raymon mcp
+
+# Claude Code
+claude mcp add --transport stdio raymon -- raymon mcp
 ```
 
 ```json
 {
   "mcpServers": {
     "raymon": {
-      "url": "http://127.0.0.1:7777/mcp"
+      "command": "raymon",
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-3) Optional: require + send auth (recommended for remote binds)
+#### Remote (Streamable HTTP)
+
+1) Start Raymon (recommended: require + send auth)
 ```bash
 export RAYMON_AUTH_TOKEN="change-me"
-RAYMON_AUTH_TOKEN="$RAYMON_AUTH_TOKEN" cargo run
+RAYMON_ALLOW_REMOTE=1 RAYMON_HOST=0.0.0.0 RAYMON_NO_TUI=1 RAYMON_AUTH_TOKEN="$RAYMON_AUTH_TOKEN" raymon
+```
 
-codex mcp add raymon --url http://127.0.0.1:7777/mcp --bearer-token-env-var RAYMON_AUTH_TOKEN
+2) Add it to your MCP client:
+```bash
+codex mcp add raymon --url http://<host>:7777/mcp --bearer-token-env-var RAYMON_AUTH_TOKEN
+```
+
+```json
+{
+  "mcpServers": {
+    "raymon": {
+      "url": "http://<host>:7777/mcp"
+    }
+  }
+}
 ```
 
 If you change `RAYMON_HOST` / `RAYMON_PORT`, update the MCP URL accordingly.
