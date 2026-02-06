@@ -220,8 +220,10 @@ The TUI is intentionally “editor-like” (vim/helix-ish):
 - `/` searches (fuzzy, message + file; path-like queries are literal), `r` opens regex search (message + file).
 - `:` searches inside detail (jq).
 - `J/K` or `PageUp/PageDown` scrolls the detail pane.
+- `s` snaps the color + type filters to the selected log entry.
 - `p` pauses/resumes live updates.
 - `x` archives the current view (writes a new archive file).
+- `n` (in the Archives pane) renames the selected archive file (confirm with Enter; Esc cancels; live cannot be renamed).
 - `d` (in the Archives pane) deletes the selected archive (confirm required; live cannot be deleted).
 - `y` yanks the selected list entry, `Y` yanks the detail pane.
 - `z` toggles JSON expanded/collapsed (default: expanded), `Z` toggles raw JSON.
