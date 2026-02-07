@@ -789,9 +789,7 @@ pub use events::{Event, EventBus};
 pub use filters::{FilterError, Filters};
 pub use state::StateStore;
 pub use types::{
-    default_screen_name, system_time_from_timestamp, timestamp_from_system_time, Entry, EntryMeta,
-    Envelope, Origin, Payload, RayEnvelope, RayMeta, RayOrigin, RayPayload, Screen, SessionId,
-    Timestamp,
+    Entry, Origin, Payload, RayEnvelope, RayMeta, RayOrigin, RayPayload, Screen,
 };
 
 #[cfg(test)]

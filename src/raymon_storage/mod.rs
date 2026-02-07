@@ -1,17 +1,23 @@
 //! Storage layer for Raymon.
 
+use std::collections::VecDeque;
 use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::raymon_core::{FilterError as CoreFilterError, Filters as CoreFilters};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+use tracing::info;
 
 mod index;
 mod jsonl;
 
 pub const DEFAULT_DATA_DIR: &str = "data";
 pub const ENTRIES_FILE: &str = "entries.jsonl";
+const RETENTION_BAK_FILE: &str = "entries.jsonl.bak";
+const RETENTION_TMP_FILE: &str = "entries.jsonl.tmp";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -40,6 +46,12 @@ pub struct EntryInput {
 #[derive(Debug, Clone)]
 pub enum EntryPayload {
     Text(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    pub dropped: usize,
+    pub kept: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,19 +132,36 @@ pub struct Storage {
     data_dir: PathBuf,
     entries_path: PathBuf,
     index: index::Index,
+    retention_max_entries: usize,
 }
 
 impl Storage {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::new_with_retention(root, 0)
+    }
+
+    pub fn new_with_retention(
+        root: impl AsRef<Path>,
+        retention_max_entries: usize,
+    ) -> Result<Self, StorageError> {
         let root = root.as_ref().to_path_buf();
         let data_dir = root.join(DEFAULT_DATA_DIR);
         let entries_path = data_dir.join(ENTRIES_FILE);
 
         fs::create_dir_all(&data_dir)?;
 
+        if let Some(outcome) = enforce_retention(&entries_path, retention_max_entries)? {
+            info!(
+                dropped = outcome.dropped,
+                kept = outcome.kept,
+                path = %entries_path.display(),
+                "storage retention pruned entries"
+            );
+        }
+
         let index = index::rebuild(&entries_path)?;
 
-        Ok(Self { root, data_dir, entries_path, index })
+        Ok(Self { root, data_dir, entries_path, index, retention_max_entries })
     }
 
     pub fn append_entry(&mut self, entry: EntryInput) -> Result<OffsetMeta, StorageError> {
@@ -153,11 +182,22 @@ impl Storage {
             payload,
         };
 
+        let entry_id = stored.id.clone();
         let (offset, len) = jsonl::append_entry(&self.entries_path, &stored)?;
         let record = index::record_from_entry(&stored, offset, len);
         let meta = record.meta.clone();
         self.index.insert(record);
-        Ok(meta)
+
+        if let Some(outcome) = self.maybe_enforce_retention()? {
+            info!(
+                dropped = outcome.dropped,
+                kept = outcome.kept,
+                path = %self.entries_path.display(),
+                "storage retention pruned entries"
+            );
+        }
+
+        Ok(self.index.get_by_id(&entry_id).cloned().unwrap_or(meta))
     }
 
     pub fn root(&self) -> &Path {
@@ -195,6 +235,95 @@ impl Storage {
         self.index = index::rebuild(&self.entries_path)?;
         Ok(())
     }
+
+    fn maybe_enforce_retention(&mut self) -> Result<Option<RetentionOutcome>, StorageError> {
+        let max_entries = self.retention_max_entries;
+        if max_entries == 0 {
+            return Ok(None);
+        }
+        let slack = retention_slack(max_entries);
+        let total = self.index.len();
+        if total <= max_entries.saturating_add(slack) {
+            return Ok(None);
+        }
+
+        let offsets = self.index.tail_offsets(max_entries);
+        rewrite_retained_offsets(&self.entries_path, &offsets)?;
+        self.rebuild_index()?;
+
+        Ok(Some(RetentionOutcome { dropped: total.saturating_sub(max_entries), kept: max_entries }))
+    }
+}
+
+fn retention_slack(max_entries: usize) -> usize {
+    (max_entries / 10).max(1).min(10_000)
+}
+
+fn enforce_retention(
+    entries_path: &Path,
+    retention_max_entries: usize,
+) -> Result<Option<RetentionOutcome>, StorageError> {
+    if retention_max_entries == 0 {
+        return Ok(None);
+    }
+
+    let mut offsets: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut total = 0usize;
+    jsonl::scan_entries(entries_path, |offset, len, _entry| {
+        total = total.saturating_add(1);
+        offsets.push_back((offset, len));
+        if offsets.len() > retention_max_entries {
+            offsets.pop_front();
+        }
+    })?;
+
+    if total <= retention_max_entries {
+        return Ok(None);
+    }
+
+    let offsets: Vec<(u64, u64)> = offsets.into_iter().collect();
+    rewrite_retained_offsets(entries_path, &offsets)?;
+
+    Ok(Some(RetentionOutcome { dropped: total.saturating_sub(retention_max_entries), kept: retention_max_entries }))
+}
+
+fn rewrite_retained_offsets(
+    entries_path: &Path,
+    offsets: &[(u64, u64)],
+) -> Result<(), StorageError> {
+    let Some(parent) = entries_path.parent() else {
+        return Ok(());
+    };
+
+    let tmp_path = parent.join(RETENTION_TMP_FILE);
+    let bak_path = parent.join(RETENTION_BAK_FILE);
+
+    {
+        let mut source = File::open(entries_path)?;
+        let tmp_file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(tmp_file);
+        let mut buf = Vec::new();
+
+        for (offset, len) in offsets {
+            source.seek(SeekFrom::Start(*offset))?;
+            buf.resize(*len as usize, 0u8);
+            source.read_exact(&mut buf)?;
+            writer.write_all(&buf)?;
+            writer.write_all(b"\n")?;
+        }
+
+        writer.flush()?;
+    }
+
+    if bak_path.exists() {
+        let _ = fs::remove_file(&bak_path);
+    }
+    if entries_path.exists() {
+        fs::rename(entries_path, &bak_path)?;
+    }
+    fs::rename(&tmp_path, entries_path)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -297,6 +426,37 @@ mod tests {
 
         let entry = storage.get_entry_by_id("entry-2").expect("get entry").expect("missing entry");
         assert_eq!(entry.summary, "second");
+    }
+
+    #[test]
+    fn retention_prunes_old_entries_on_reload() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut storage = Storage::new(dir.path()).expect("storage");
+            for idx in 1..=5 {
+                let input = EntryInput {
+                    id: format!("entry-{idx}"),
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: "home".to_string(),
+                    session: "sess-a".to_string(),
+                    summary: format!("entry-{idx}"),
+                    search_text: format!("entry-{idx}"),
+                    types: Vec::new(),
+                    colors: Vec::new(),
+                    payload: EntryPayload::Text("payload".to_string()),
+                };
+                storage.append_entry(input).expect("append entry");
+            }
+        }
+
+        let storage = Storage::new_with_retention(dir.path(), 3).expect("storage reload");
+        let listed = storage.list_entries(None);
+        let ids: Vec<String> = listed.into_iter().map(|meta| meta.id.to_string()).collect();
+        assert_eq!(ids, vec!["entry-3".to_string(), "entry-4".to_string(), "entry-5".to_string()]);
+
+        let entry = storage.get_entry_by_id("entry-1").expect("get entry");
+        assert!(entry.is_none());
     }
 
     #[rstest]

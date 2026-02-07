@@ -285,13 +285,14 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_MAX_BODY_BYTES` | `1048576` | Max size (bytes) for HTTP POST bodies. |
 | `RAYMON_MAX_QUERY_LEN` | `265` | Max length (bytes) for search/command/picker queries. |
 | `RAYMON_MAX_ENTRIES` | `10000` | Max number of entries kept in memory for the core state (MCP + resync). `0` disables eviction. |
+| `RAYMON_STORAGE_MAX_ENTRIES` | `100000` | Max number of entries kept in `data/entries.jsonl`. When exceeded, Raymon rewrites the JSONL file keeping the newest entries. `0` disables retention. |
 | `RAYMON_JQ_TIMEOUT_MS` | `10000` | `jq` timeout in milliseconds. |
 | `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
 | `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow binding to non-loopback addresses without auth (NOT recommended). |
 | `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests. |
 | `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
 
-Raymon also supports a `ray.json` config file (searched from the current directory upwards). Keys mirror env vars (e.g. `host`, `port`, `tui`, `max_entries`). CLI flags override env and file config.
+Raymon also supports a `ray.json` config file (searched from the current directory upwards). Keys mirror env vars (e.g. `host`, `port`, `tui`, `max_entries`, `storage_max_entries`). CLI flags override env and file config.
 
 ## License
 

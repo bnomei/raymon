@@ -650,7 +650,7 @@ async fn broadcast_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raymon_core::{default_screen_name, Entry, Origin, Payload};
+    use crate::raymon_core::{types::default_screen_name, Entry, Origin, Payload};
     use rmcp::handler::server::common::schema_for_type;
     use rmcp::model::ErrorCode;
     use serde_json::json;

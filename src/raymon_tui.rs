@@ -645,6 +645,7 @@ pub struct Tui {
     viewing_archive: Option<PathBuf>,
     live_archive: Option<LiveArchive>,
     follow_tail: bool,
+    filter_dirty: bool,
     events_per_min: u32,
     events_bucket_start: Instant,
     events_bucket_idx: usize,
@@ -700,6 +701,7 @@ impl Tui {
             viewing_archive: None,
             live_archive: None,
             follow_tail: false,
+            filter_dirty: false,
             events_per_min: 0,
             events_bucket_start: now,
             events_bucket_idx: 0,
@@ -723,6 +725,7 @@ impl Tui {
             viewing_archive: None,
             live_archive: None,
             follow_tail: false,
+            filter_dirty: false,
             events_per_min: 0,
             events_bucket_start: now,
             events_bucket_idx: 0,
@@ -877,7 +880,16 @@ impl Tui {
             self.state.queued.push(entry);
         } else {
             self.state.logs.push(entry);
-            self.recompute_filter();
+            if self.state.search.buffer.trim().is_empty() {
+                let idx = self.state.logs.len().saturating_sub(1);
+                if let Some(entry) = self.state.logs.get(idx) {
+                    if self.entry_matches_filters(entry) {
+                        self.state.filtered.push(idx);
+                    }
+                }
+            } else {
+                self.filter_dirty = true;
+            }
             if follow_tail {
                 self.state.selected = self.state.filtered.len().saturating_sub(1);
                 self.state.last_detail_search = None;
@@ -1326,6 +1338,9 @@ impl Tui {
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        if self.filter_dirty {
+            self.recompute_filter();
+        }
         self.tick_events_per_min(Instant::now());
 
         let size = frame.area();
@@ -2219,6 +2234,7 @@ impl Tui {
     }
 
     fn recompute_filter(&mut self) {
+        self.filter_dirty = false;
         let raw_query = self.state.search.buffer.clone();
         let trimmed = raw_query.trim();
         let base_indices = self.base_filter_indices();
@@ -4623,8 +4639,8 @@ fn run_jq_command(
         shlex::split(command).ok_or_else(|| TuiError::InvalidCommandLine(command.into()))?;
     let (program, args) =
         parts.split_first().ok_or_else(|| TuiError::InvalidCommandLine(command.into()))?;
-    let mut stdout_file = NamedTempFile::new()?;
-    let mut stderr_file = NamedTempFile::new()?;
+    let stdout_file = NamedTempFile::new()?;
+    let stderr_file = NamedTempFile::new()?;
     let stdout = stdout_file.reopen()?;
     let stderr = stderr_file.reopen()?;
     let output = Command::new(program)
@@ -4755,6 +4771,15 @@ mod tests {
         let clipboard = MockClipboard { value: value.clone() };
         let tui = Tui::with_clipboard(TuiConfig::default(), Box::new(clipboard));
         (tui, value)
+    }
+
+    fn render_once(tui: &mut Tui) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| tui.render(frame)).expect("draw");
     }
 
     fn seed_logs(tui: &mut Tui) {
@@ -5067,6 +5092,81 @@ mod tests {
         }
 
         assert_eq!(tui.state.filtered, vec![1]);
+    }
+
+    #[test]
+    fn push_log_updates_filtered_incrementally_when_query_is_empty() {
+        let (mut tui, _) = make_tui();
+        tui.state.active_screen = Some("main".to_string());
+
+        tui.push_log(LogEntry {
+            id: 1,
+            uuid: "00000000-0000-0000-0000-000000000010".to_string(),
+            message: "alpha".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        });
+
+        assert!(!tui.filter_dirty);
+        assert_eq!(tui.state.filtered, vec![0]);
+
+        tui.push_log(LogEntry {
+            id: 2,
+            uuid: "00000000-0000-0000-0000-000000000011".to_string(),
+            message: "beta".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(2_000),
+            entry_type: Some("log".to_string()),
+            color: Some("blue".to_string()),
+            screen: Some("secondary".to_string()),
+        });
+
+        assert!(!tui.filter_dirty);
+        assert_eq!(tui.state.filtered, vec![0]);
+    }
+
+    #[test]
+    fn push_log_marks_filter_dirty_and_recomputes_on_render() {
+        let (mut tui, _) = make_tui();
+        seed_logs(&mut tui);
+
+        tui.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        for ch in "alp".chars() {
+            tui.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(tui.state.filtered.len(), 2);
+
+        tui.push_log(LogEntry {
+            id: 4,
+            uuid: "00000000-0000-0000-0000-000000000004".to_string(),
+            message: "alpha again".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(4_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        });
+
+        assert!(tui.filter_dirty);
+        assert_eq!(tui.state.filtered.len(), 2);
+
+        render_once(&mut tui);
+
+        assert!(!tui.filter_dirty);
+        assert_eq!(tui.state.filtered.len(), 3);
+        assert!(tui.state.filtered.contains(&3));
     }
 
     #[rstest]

@@ -63,6 +63,7 @@ const TUI_TICK_MS: u64 = 50;
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_QUERY_LEN: usize = 265;
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
+const DEFAULT_STORAGE_MAX_ENTRIES: usize = 100_000;
 const DEFAULT_MAX_CONCURRENCY: usize = 64;
 const DEFAULT_JQ_TIMEOUT_MS: u64 = 10_000;
 
@@ -121,6 +122,7 @@ struct Config {
     max_body_bytes: usize,
     max_query_len: usize,
     max_entries: usize,
+    storage_max_entries: usize,
     jq_timeout_ms: u64,
     allow_remote: bool,
     allow_insecure_remote: bool,
@@ -139,6 +141,7 @@ struct PartialConfig {
     max_body_bytes: Option<usize>,
     max_query_len: Option<usize>,
     max_entries: Option<usize>,
+    storage_max_entries: Option<usize>,
     jq_timeout_ms: Option<u64>,
     allow_remote: Option<bool>,
     allow_insecure_remote: Option<bool>,
@@ -177,6 +180,9 @@ impl PartialConfig {
         if other.max_entries.is_some() {
             self.max_entries = other.max_entries;
         }
+        if other.storage_max_entries.is_some() {
+            self.storage_max_entries = other.storage_max_entries;
+        }
         if other.jq_timeout_ms.is_some() {
             self.jq_timeout_ms = other.jq_timeout_ms;
         }
@@ -205,6 +211,9 @@ impl Config {
             max_body_bytes: partial.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
             max_query_len: partial.max_query_len.unwrap_or(DEFAULT_MAX_QUERY_LEN),
             max_entries: partial.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES),
+            storage_max_entries: partial
+                .storage_max_entries
+                .unwrap_or(DEFAULT_STORAGE_MAX_ENTRIES),
             jq_timeout_ms: partial.jq_timeout_ms.unwrap_or(DEFAULT_JQ_TIMEOUT_MS),
             allow_remote: partial.allow_remote.unwrap_or(false),
             allow_insecure_remote: partial.allow_insecure_remote.unwrap_or(false),
@@ -229,6 +238,8 @@ struct FileConfig {
     max_query_len: Option<usize>,
     #[serde(alias = "maxEntries", alias = "max-entries")]
     max_entries: Option<usize>,
+    #[serde(alias = "storageMaxEntries", alias = "storage-max-entries")]
+    storage_max_entries: Option<usize>,
     jq_timeout_ms: Option<u64>,
     allow_remote: Option<bool>,
     #[serde(alias = "allowInsecureRemote", alias = "allow-insecure-remote")]
@@ -255,6 +266,7 @@ impl FileConfig {
             max_body_bytes: self.max_body_bytes,
             max_query_len: self.max_query_len,
             max_entries: self.max_entries,
+            storage_max_entries: self.storage_max_entries,
             jq_timeout_ms: self.jq_timeout_ms,
             allow_remote: self.allow_remote,
             allow_insecure_remote: self.allow_insecure_remote,
@@ -638,8 +650,9 @@ fn build_state(
     storage_root: &Path,
     collect_logs: bool,
     max_entries: usize,
+    storage_max_entries: usize,
 ) -> Result<(AppState, Vec<LogEntry>), DynError> {
-    let storage = RaymonStorage::new(storage_root)?;
+    let storage = RaymonStorage::new_with_retention(storage_root, storage_max_entries)?;
     let core = CoreState::new(max_entries);
     let logs = restore_from_storage(&core, &storage, collect_logs)?;
     Ok((AppState { core, storage: StorageHandle::new(storage), bus: CoreBus::new() }, logs))
@@ -648,7 +661,7 @@ fn build_state(
 fn entry_to_storage_input(entry: &CoreEntry) -> Result<EntryInput, String> {
     let payload_text = serde_json::to_string(entry).map_err(|error| error.to_string())?;
     let summary = summarize_entry(entry, &payload_text);
-    let search = build_search_text(entry, &payload_text);
+    let search = build_search_text(entry);
 
     Ok(EntryInput {
         id: entry.uuid.clone(),
@@ -683,7 +696,7 @@ struct SearchTextMetadata {
     colors: Vec<String>,
 }
 
-fn build_search_text(entry: &CoreEntry, payload_text: &str) -> SearchTextMetadata {
+fn build_search_text(entry: &CoreEntry) -> SearchTextMetadata {
     fn push_token(out: &mut String, is_first: &mut bool, token: &str) {
         if token.is_empty() {
             return;
@@ -696,10 +709,11 @@ fn build_search_text(entry: &CoreEntry, payload_text: &str) -> SearchTextMetadat
         out.push_str(token);
     }
 
+    const MESSAGE_TOKEN_LIMIT: usize = 1024;
+
     let mut cap = entry.project.len()
         + entry.host.len()
         + entry.screen.as_str().len()
-        + payload_text.len()
         + 4;
     if let Some(session) = &entry.session_id {
         cap += session.as_str().len() + 1;
@@ -717,6 +731,9 @@ fn build_search_text(entry: &CoreEntry, payload_text: &str) -> SearchTextMetadat
         }
         if payload.origin.line_number.is_some() {
             cap += 11;
+        }
+        if let Some(message) = payload.content.get("message").and_then(|value| value.as_str()) {
+            cap += message.len().min(MESSAGE_TOKEN_LIMIT) + 1;
         }
     }
 
@@ -761,8 +778,16 @@ fn build_search_text(entry: &CoreEntry, payload_text: &str) -> SearchTextMetadat
             let mut buffer = itoa::Buffer::new();
             push_token(&mut search_text, &mut is_first, buffer.format(line));
         }
+        if let Some(message) = payload
+            .content
+            .get("message")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            let message = truncate(message, MESSAGE_TOKEN_LIMIT);
+            push_token(&mut search_text, &mut is_first, &message);
+        }
     }
-    push_token(&mut search_text, &mut is_first, payload_text);
 
     SearchTextMetadata { search_text, types, colors }
 }
@@ -1096,6 +1121,9 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
     }
     if let Some(value) = env.get("RAYMON_MAX_ENTRIES") {
         partial.max_entries = Some(parse_usize("RAYMON_MAX_ENTRIES", value)?);
+    }
+    if let Some(value) = env.get("RAYMON_STORAGE_MAX_ENTRIES") {
+        partial.storage_max_entries = Some(parse_usize("RAYMON_STORAGE_MAX_ENTRIES", value)?);
     }
     if let Some(value) = env.get("RAYMON_JQ_TIMEOUT_MS") {
         partial.jq_timeout_ms = Some(parse_u64("RAYMON_JQ_TIMEOUT_MS", value)?);
@@ -2153,6 +2181,7 @@ pub async fn run() -> Result<(), DynError> {
         max_body_bytes = config.max_body_bytes,
         max_query_len = config.max_query_len,
         max_entries = config.max_entries,
+        storage_max_entries = config.storage_max_entries,
         jq_timeout_ms = config.jq_timeout_ms,
         auth_enabled = config.auth_token.is_some(),
         ide = ?config.ide,
@@ -2170,7 +2199,8 @@ pub async fn run() -> Result<(), DynError> {
     info!(path = %storage_root.display(), "storage root");
 
     // Archives are file-backed per TUI session; start the live stream empty.
-    let (state, initial_logs) = build_state(&storage_root, false, config.max_entries)?;
+    let (state, initial_logs) =
+        build_state(&storage_root, false, config.max_entries, config.storage_max_entries)?;
     let (shutdown_tx, _) = broadcast::channel(4);
     let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -2510,11 +2540,45 @@ mod tests {
             }],
         };
 
-        let search = build_search_text(&entry, "payload");
+        let search = build_search_text(&entry);
         assert!(search.search_text.contains("log"));
         assert!(search.search_text.contains("red"));
         assert_eq!(search.types, vec!["log".to_string()]);
         assert_eq!(search.colors, vec!["red".to_string()]);
+    }
+
+    #[test]
+    fn build_search_text_does_not_include_full_payload_json() {
+        let screen = Screen::new("proj:host:default");
+        let entry = CoreEntry {
+            uuid: "entry-1".to_string(),
+            received_at: 1,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({
+                    "message": "hello",
+                    "color": "red"
+                }),
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        };
+
+        let payload_text = serde_json::to_string(&entry).expect("serialize entry");
+        let search = build_search_text(&entry);
+        assert!(!search.search_text.contains(&payload_text));
+        assert!(search.search_text.contains("hello"));
     }
 
     #[test]
@@ -2549,7 +2613,7 @@ mod tests {
         let input = entry_to_storage_input(&entry).expect("storage input");
         storage.append_entry(input).expect("append");
 
-        let (state, logs) = build_state(root, true, 0).expect("build state");
+        let (state, logs) = build_state(root, true, 0, 0).expect("build state");
         let restored = state.core.get(&entry.uuid).expect("get entry");
         assert!(restored.is_some());
         assert_eq!(logs.len(), 1);

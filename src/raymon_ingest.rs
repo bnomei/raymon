@@ -1,12 +1,5 @@
 //! HTTP ingest handlers for Raymon.
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::Router;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::raymon_core::{Entry, Event, RayEnvelope};
@@ -214,35 +207,6 @@ pub fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
-}
-
-pub fn router<S, T, B, C>(ingestor: Arc<Ingestor<S, T, B, C>>) -> Router
-where
-    S: StateStore + Send + Sync + 'static,
-    T: Storage + Send + Sync + 'static,
-    B: EventBus + Send + Sync + 'static,
-    C: Fn() -> u64 + Send + Sync + 'static,
-{
-    Router::new().route("/", post(ingest_handler::<S, T, B, C>)).with_state(ingestor)
-}
-
-async fn ingest_handler<S, T, B, C>(
-    State(ingestor): State<Arc<Ingestor<S, T, B, C>>>,
-    bytes: Bytes,
-) -> Response
-where
-    S: StateStore + Send + Sync + 'static,
-    T: Storage + Send + Sync + 'static,
-    B: EventBus + Send + Sync + 'static,
-    C: Fn() -> u64 + Send + Sync + 'static,
-{
-    let response = ingestor.handle(&bytes);
-    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-    match response.error {
-        Some(error) => (status, error).into_response(),
-        None => status.into_response(),
-    }
 }
 
 #[cfg(test)]
