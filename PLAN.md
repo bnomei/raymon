@@ -1,5 +1,8 @@
 # Ray-Compatible CLI + MCP Server Plan
 
+> Note (2026-02-07): The currently maintained implementation lives in the root crate (`Cargo.toml` + `src/*`).
+> An older workspace split was archived to `legacy/crates/` and is not maintained.
+
 ## Overview
 Build a single CLI process that:
 1. Receives Ray HTTP payloads with full compatibility to the official Ray app.

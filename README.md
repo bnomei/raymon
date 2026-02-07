@@ -7,9 +7,15 @@ Raymon is:
 - MCP-first: a small set of tools with explicit schemas for agents/LLMs.
 - Keyboard-first: a Ratatui TUI designed for fast filtering, yanking, and navigation.
 
+## Development Notes
+
+The source of truth is the root crate (`Cargo.toml` + `src/*`).
+
+`legacy/crates/` contains an archived, older workspace split that is not maintained.
+
 > [!Warning]
 > Raymon binds to `127.0.0.1` by default. If you enable remote binds (`RAYMON_ALLOW_REMOTE=1`),
-> set `RAYMON_AUTH_TOKEN` and keep the server on a trusted network.
+> Raymon requires `RAYMON_AUTH_TOKEN` by default. Use `RAYMON_ALLOW_INSECURE_REMOTE=1` only on a trusted network.
 
 ## Quickstart
 
@@ -76,6 +82,8 @@ claude mcp add --transport stdio raymon -- raymon mcp
 export RAYMON_AUTH_TOKEN="change-me"
 RAYMON_ALLOW_REMOTE=1 RAYMON_HOST=0.0.0.0 RAYMON_NO_TUI=1 RAYMON_AUTH_TOKEN="$RAYMON_AUTH_TOKEN" raymon
 ```
+
+Raymon will refuse non-loopback binds without `RAYMON_AUTH_TOKEN` unless you set `RAYMON_ALLOW_INSECURE_REMOTE=1`.
 
 2) Add it to your MCP client:
 ```bash
@@ -276,12 +284,14 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_PALETTE` | unset | Alias for `RAYMON_TUI_PALETTE`. |
 | `RAYMON_MAX_BODY_BYTES` | `1048576` | Max size (bytes) for HTTP POST bodies. |
 | `RAYMON_MAX_QUERY_LEN` | `265` | Max length (bytes) for search/command/picker queries. |
+| `RAYMON_MAX_ENTRIES` | `10000` | Max number of entries kept in memory for the core state (MCP + resync). `0` disables eviction. |
 | `RAYMON_JQ_TIMEOUT_MS` | `10000` | `jq` timeout in milliseconds. |
 | `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
+| `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow binding to non-loopback addresses without auth (NOT recommended). |
 | `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests. |
 | `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
 
-Raymon also supports a `ray.json` config file (searched from the current directory upwards). CLI flags override env and file config.
+Raymon also supports a `ray.json` config file (searched from the current directory upwards). Keys mirror env vars (e.g. `host`, `port`, `tui`, `max_entries`). CLI flags override env and file config.
 
 ## License
 

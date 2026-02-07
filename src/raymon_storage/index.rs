@@ -3,7 +3,7 @@ use std::path::Path;
 
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use smol_str::SmolStr;
 
@@ -203,7 +203,6 @@ fn derive_core_metadata(entry: &StoredEntry) -> CoreMetadata {
 
     let text = match &entry.payload {
         StoredPayload::Text { text } => text,
-        _ => return CoreMetadata::default(),
     };
     let Ok(core_entry) = serde_json::from_str::<CoreEntry>(text) else {
         return CoreMetadata::default();
@@ -344,7 +343,10 @@ fn strip_regex_delimiters(query: &str) -> Option<&str> {
 }
 
 fn compile_regex(pattern: &str) -> Result<Regex, CoreFilterError> {
-    Regex::new(pattern).map_err(|error| CoreFilterError::InvalidRegex {
+    RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| CoreFilterError::InvalidRegex {
         pattern: pattern.to_string(),
         message: error.to_string(),
     })

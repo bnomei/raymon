@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     hash::{Hash, Hasher},
     io::{self, Write},
@@ -62,6 +62,8 @@ const SUMMARY_LIMIT: usize = 160;
 const TUI_TICK_MS: u64 = 50;
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_QUERY_LEN: usize = 265;
+const DEFAULT_MAX_ENTRIES: usize = 10_000;
+const DEFAULT_MAX_CONCURRENCY: usize = 64;
 const DEFAULT_JQ_TIMEOUT_MS: u64 = 10_000;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -71,6 +73,8 @@ enum UiEvent {
     Log(LogEntry),
     ClearScreen(String),
     ClearAll,
+    Resync { dropped: usize, logs: Vec<LogEntry> },
+    Notice(String),
     Quit,
 }
 
@@ -116,8 +120,10 @@ struct Config {
     tui_enabled: bool,
     max_body_bytes: usize,
     max_query_len: usize,
+    max_entries: usize,
     jq_timeout_ms: u64,
     allow_remote: bool,
+    allow_insecure_remote: bool,
     auth_token: Option<String>,
 }
 
@@ -132,8 +138,10 @@ struct PartialConfig {
     tui_enabled: Option<bool>,
     max_body_bytes: Option<usize>,
     max_query_len: Option<usize>,
+    max_entries: Option<usize>,
     jq_timeout_ms: Option<u64>,
     allow_remote: Option<bool>,
+    allow_insecure_remote: Option<bool>,
     auth_token: Option<String>,
 }
 
@@ -166,11 +174,17 @@ impl PartialConfig {
         if other.max_query_len.is_some() {
             self.max_query_len = other.max_query_len;
         }
+        if other.max_entries.is_some() {
+            self.max_entries = other.max_entries;
+        }
         if other.jq_timeout_ms.is_some() {
             self.jq_timeout_ms = other.jq_timeout_ms;
         }
         if other.allow_remote.is_some() {
             self.allow_remote = other.allow_remote;
+        }
+        if other.allow_insecure_remote.is_some() {
+            self.allow_insecure_remote = other.allow_insecure_remote;
         }
         if other.auth_token.is_some() {
             self.auth_token = other.auth_token;
@@ -190,8 +204,10 @@ impl Config {
             tui_enabled: partial.tui_enabled.unwrap_or(DEFAULT_TUI_ENABLED),
             max_body_bytes: partial.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
             max_query_len: partial.max_query_len.unwrap_or(DEFAULT_MAX_QUERY_LEN),
+            max_entries: partial.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES),
             jq_timeout_ms: partial.jq_timeout_ms.unwrap_or(DEFAULT_JQ_TIMEOUT_MS),
             allow_remote: partial.allow_remote.unwrap_or(false),
+            allow_insecure_remote: partial.allow_insecure_remote.unwrap_or(false),
             auth_token: partial.auth_token,
         }
     }
@@ -211,8 +227,12 @@ struct FileConfig {
     no_tui: Option<bool>,
     max_body_bytes: Option<usize>,
     max_query_len: Option<usize>,
+    #[serde(alias = "maxEntries", alias = "max-entries")]
+    max_entries: Option<usize>,
     jq_timeout_ms: Option<u64>,
     allow_remote: Option<bool>,
+    #[serde(alias = "allowInsecureRemote", alias = "allow-insecure-remote")]
+    allow_insecure_remote: Option<bool>,
     auth_token: Option<String>,
 }
 
@@ -234,8 +254,10 @@ impl FileConfig {
             tui_enabled,
             max_body_bytes: self.max_body_bytes,
             max_query_len: self.max_query_len,
+            max_entries: self.max_entries,
             jq_timeout_ms: self.jq_timeout_ms,
             allow_remote: self.allow_remote,
+            allow_insecure_remote: self.allow_insecure_remote,
             auth_token: self.auth_token,
         }
     }
@@ -279,14 +301,16 @@ impl AppState {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CoreState {
     inner: Arc<RwLock<StateInner>>,
+    max_entries: usize,
 }
 
 #[derive(Default)]
 struct StateInner {
-    entries: Vec<CoreEntry>,
+    entries_by_uuid: HashMap<String, CoreEntry>,
+    order: VecDeque<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -298,33 +322,33 @@ enum StateError {
 }
 
 impl CoreState {
+    fn new(max_entries: usize) -> Self {
+        Self { inner: Arc::new(RwLock::new(StateInner::default())), max_entries }
+    }
+
     fn insert(&self, entry: CoreEntry) -> Result<(), StateError> {
         let mut inner = self.inner.write().map_err(|_| StateError::Poisoned)?;
-        inner.entries.push(entry);
+        inner.upsert(entry);
+        self.enforce_retention(&mut inner);
         Ok(())
     }
 
     fn update(&self, entry: CoreEntry) -> Result<(), StateError> {
         let mut inner = self.inner.write().map_err(|_| StateError::Poisoned)?;
-        if let Some(existing) =
-            inner.entries.iter_mut().find(|existing| existing.uuid == entry.uuid)
-        {
-            *existing = entry;
-        } else {
-            inner.entries.push(entry);
-        }
+        inner.upsert(entry);
+        self.enforce_retention(&mut inner);
         Ok(())
     }
 
     fn get(&self, uuid: &str) -> Result<Option<CoreEntry>, StateError> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
-        Ok(inner.entries.iter().find(|entry| entry.uuid == uuid).cloned())
+        Ok(inner.entries_by_uuid.get(uuid).cloned())
     }
 
     fn list(&self, filters: &Filters) -> Result<Vec<CoreEntry>, StateError> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
         let matches = filters
-            .apply(inner.entries.iter())
+            .apply(inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)))
             .map_err(|error| StateError::Filter(error.to_string()))?;
         Ok(matches.into_iter().cloned().collect())
     }
@@ -332,7 +356,7 @@ impl CoreState {
     fn list_screens(&self) -> Result<Vec<Screen>, StateError> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
         let mut unique = HashSet::new();
-        for entry in &inner.entries {
+        for entry in inner.entries_by_uuid.values() {
             unique.insert(entry.screen.clone());
         }
         Ok(unique.into_iter().collect())
@@ -340,14 +364,59 @@ impl CoreState {
 
     fn clear_screen(&self, screen: &Screen) -> Result<(), StateError> {
         let mut inner = self.inner.write().map_err(|_| StateError::Poisoned)?;
-        inner.entries.retain(|entry| &entry.screen != screen);
+        let old_order = std::mem::take(&mut inner.order);
+        for uuid in old_order {
+            let remove = match inner.entries_by_uuid.get(&uuid) {
+                Some(entry) => &entry.screen == screen,
+                None => false,
+            };
+            if remove {
+                inner.entries_by_uuid.remove(&uuid);
+            } else if inner.entries_by_uuid.contains_key(&uuid) {
+                inner.order.push_back(uuid);
+            }
+        }
         Ok(())
     }
 
     fn clear_all(&self) -> Result<(), StateError> {
         let mut inner = self.inner.write().map_err(|_| StateError::Poisoned)?;
-        inner.entries.clear();
+        inner.entries_by_uuid.clear();
+        inner.order.clear();
         Ok(())
+    }
+
+    fn enforce_retention(&self, inner: &mut StateInner) {
+        let max_entries = self.max_entries;
+        if max_entries == 0 {
+            return;
+        }
+
+        while inner.entries_by_uuid.len() > max_entries {
+            let Some(uuid) = inner.order.pop_front() else {
+                break;
+            };
+            if inner.entries_by_uuid.remove(&uuid).is_some() {
+                warn!(max_entries, evicted_uuid = %uuid, "core state retention evicted entry");
+            }
+        }
+    }
+}
+
+impl Default for CoreState {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl StateInner {
+    fn upsert(&mut self, entry: CoreEntry) {
+        let uuid = entry.uuid.clone();
+        let is_new = !self.entries_by_uuid.contains_key(&uuid);
+        self.entries_by_uuid.insert(uuid.clone(), entry);
+        if is_new {
+            self.order.push_back(uuid);
+        }
     }
 }
 
@@ -484,7 +553,6 @@ fn restore_from_storage(
     let mut restored = 0usize;
     let mut skipped = 0usize;
     let mut logs = Vec::new();
-    let mut seen = HashSet::new();
 
     loop {
         buf.clear();
@@ -508,7 +576,21 @@ fn restore_from_storage(
         let stored: StoredEntry = match serde_json::from_slice(line_bytes) {
             Ok(entry) => entry,
             Err(err) => {
-                warn!(?err, offset, "Skipping corrupt JSONL entry");
+                let is_legacy_blob = serde_json::from_slice::<serde_json::Value>(line_bytes)
+                    .ok()
+                    .is_some_and(|value| {
+                        value
+                            .get("payload")
+                            .and_then(|payload| payload.get("kind"))
+                            .and_then(|kind| kind.as_str())
+                            == Some("blob")
+                    });
+
+                if is_legacy_blob {
+                    warn!(offset, "Skipping JSONL entry with blob payload");
+                } else {
+                    warn!(?err, offset, "Skipping corrupt JSONL entry");
+                }
                 skipped += 1;
                 offset += bytes as u64;
                 continue;
@@ -525,24 +607,12 @@ fn restore_from_storage(
                     continue;
                 }
             },
-            StoredPayload::Blob { .. } => {
-                warn!(offset, "Skipping JSONL entry with blob payload");
-                skipped += 1;
-                offset += bytes as u64;
-                continue;
-            }
         };
 
         crate::sanitize::sanitize_entry(&mut core_entry);
 
         let log_entry = collect_logs.then(|| log_entry_from_core(&core_entry));
-        let is_first = seen.insert(core_entry.uuid.clone());
-
-        if is_first {
-            core.insert(core_entry).map_err(|error| -> DynError { Box::new(error) })?;
-        } else {
-            core.update(core_entry).map_err(|error| -> DynError { Box::new(error) })?;
-        }
+        core.update(core_entry).map_err(|error| -> DynError { Box::new(error) })?;
 
         if let Some(log_entry) = log_entry {
             logs.push(log_entry);
@@ -567,9 +637,10 @@ fn restore_from_storage(
 fn build_state(
     storage_root: &Path,
     collect_logs: bool,
+    max_entries: usize,
 ) -> Result<(AppState, Vec<LogEntry>), DynError> {
     let storage = RaymonStorage::new(storage_root)?;
-    let core = CoreState::default();
+    let core = CoreState::new(max_entries);
     let logs = restore_from_storage(&core, &storage, collect_logs)?;
     Ok((AppState { core, storage: StorageHandle::new(storage), bus: CoreBus::new() }, logs))
 }
@@ -1023,11 +1094,19 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
     if let Some(value) = env.get("RAYMON_MAX_QUERY_LEN") {
         partial.max_query_len = Some(parse_usize("RAYMON_MAX_QUERY_LEN", value)?);
     }
+    if let Some(value) = env.get("RAYMON_MAX_ENTRIES") {
+        partial.max_entries = Some(parse_usize("RAYMON_MAX_ENTRIES", value)?);
+    }
     if let Some(value) = env.get("RAYMON_JQ_TIMEOUT_MS") {
         partial.jq_timeout_ms = Some(parse_u64("RAYMON_JQ_TIMEOUT_MS", value)?);
     }
     if let Some(value) = env.get("RAYMON_ALLOW_REMOTE") {
         partial.allow_remote = Some(parse_bool("RAYMON_ALLOW_REMOTE", value)?);
+    }
+    if let Some(value) =
+        env.get("RAYMON_ALLOW_INSECURE_REMOTE").or_else(|| env.get("RAYMON_INSECURE_REMOTE"))
+    {
+        partial.allow_insecure_remote = Some(parse_bool("RAYMON_ALLOW_INSECURE_REMOTE", value)?);
     }
     if let Some(value) = env.get("RAYMON_AUTH_TOKEN").or_else(|| env.get("RAYMON_TOKEN")) {
         if !value.trim().is_empty() {
@@ -1234,11 +1313,24 @@ async fn run_server(
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<(), DynError> {
     let addr = resolve_bind_addr(&config.host, config.port)?;
-    if !config.allow_remote && !addr.ip().is_loopback() {
-        return Err(format!(
-            "refusing to bind to non-loopback address {addr}. Set RAYMON_ALLOW_REMOTE=1 if you really want remote access."
-        )
-        .into());
+    if !addr.ip().is_loopback() {
+        if !config.allow_remote {
+            return Err(format!(
+                "refusing to bind to non-loopback address {addr}. Set RAYMON_ALLOW_REMOTE=1 if you really want remote access."
+            )
+            .into());
+        }
+
+        if config.auth_token.is_none() && !config.allow_insecure_remote {
+            return Err(format!(
+                "refusing to bind to non-loopback address {addr} without auth. Set RAYMON_AUTH_TOKEN (recommended) or set RAYMON_ALLOW_INSECURE_REMOTE=1 to override."
+            )
+            .into());
+        }
+
+        if config.auth_token.is_none() && config.allow_insecure_remote {
+            warn!(%addr, "binding to non-loopback without auth (insecure override enabled)");
+        }
     }
     let app = build_router(
         state,
@@ -1261,6 +1353,7 @@ async fn run_server(
 
 async fn run_tui(
     config: TuiConfig,
+    core: CoreState,
     bus: CoreBus,
     initial_logs: Vec<LogEntry>,
     mut shutdown: broadcast::Receiver<()>,
@@ -1281,31 +1374,13 @@ async fn run_tui(
         }
     }
 
-    let forward_handle = tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    let ui_event = match event {
-                        CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
-                            Some(UiEvent::Log(log_entry_from_core(&entry)))
-                        }
-                        CoreEvent::ScreenCleared(screen) => {
-                            Some(UiEvent::ClearScreen(screen.as_str().to_string()))
-                        }
-                        CoreEvent::StateCleared => Some(UiEvent::ClearAll),
-                    };
-
-                    if let Some(ui_event) = ui_event {
-                        if log_tx_forward.send(ui_event).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    let started_at = crate::raymon_ingest::now_millis();
+    let forward_handle = tokio::spawn(forward_events_to_ui(
+        event_rx,
+        log_tx_forward,
+        core,
+        started_at,
+    ));
 
     let shutdown_handle = tokio::spawn(async move {
         let _ = shutdown.recv().await;
@@ -1346,6 +1421,15 @@ fn run_tui_loop(
                 UiEvent::Log(entry) => tui.push_log(entry),
                 UiEvent::ClearScreen(screen) => tui.clear_screen_for(Some(&screen)),
                 UiEvent::ClearAll => tui.clear_screen_for(None),
+                UiEvent::Resync { dropped, logs } => {
+                    tui.resync_live_logs(
+                        logs,
+                        format!("Dropped {dropped} events; resynced from state"),
+                    );
+                }
+                UiEvent::Notice(message) => {
+                    tui.state.detail_notice = Some(message);
+                }
                 UiEvent::Quit => {
                     let _ = shutdown_tx.send(());
                     running.store(false, Ordering::SeqCst);
@@ -1439,6 +1523,69 @@ fn run_tui_loop(
     Ok(())
 }
 
+async fn forward_events_to_ui(
+    mut event_rx: broadcast::Receiver<CoreEvent>,
+    ui_tx: std::sync::mpsc::Sender<UiEvent>,
+    core: CoreState,
+    started_at: u64,
+) {
+    let mut seen_uuids: HashSet<String> = HashSet::new();
+    let mut dropped_total: usize = 0;
+
+    loop {
+        match event_rx.recv().await {
+            Ok(event) => {
+                let ui_event = match event {
+                    CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
+                        seen_uuids.insert(entry.uuid.clone());
+                        Some(UiEvent::Log(log_entry_from_core(&entry)))
+                    }
+                    CoreEvent::ScreenCleared(screen) => {
+                        Some(UiEvent::ClearScreen(screen.as_str().to_string()))
+                    }
+                    CoreEvent::StateCleared => Some(UiEvent::ClearAll),
+                };
+
+                if let Some(ui_event) = ui_event {
+                    if ui_tx.send(ui_event).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                dropped_total = dropped_total.saturating_add((skipped.min(usize::MAX as u64)) as usize);
+
+                let entries = match core.list(&Filters::default()) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        let _ = ui_tx.send(UiEvent::Notice(format!(
+                            "Dropped {dropped_total} events; resync failed: {error}"
+                        )));
+                        dropped_total = 0;
+                        continue;
+                    }
+                };
+
+                let mut logs = Vec::new();
+                for entry in entries {
+                    if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
+                        logs.push(log_entry_from_core(&entry));
+                    }
+                }
+                for log in &logs {
+                    seen_uuids.insert(log.uuid.clone());
+                }
+
+                if ui_tx.send(UiEvent::Resync { dropped: dropped_total, logs }).is_err() {
+                    break;
+                }
+                dropped_total = 0;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -1503,11 +1650,14 @@ fn build_router(
     )?;
     let router_state = RouterState { app: state, mcp: mcp_service.clone() };
     let auth_state = AuthState { token: auth_token };
+    let concurrency_state =
+        ConcurrencyState { semaphore: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENCY)) };
     let router = Router::new()
         .route("/", post(ingest_or_mcp_handler))
         .route_service("/mcp", mcp_service)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware))
+        .route_layer(middleware::from_fn_with_state(concurrency_state, concurrency_middleware))
         .with_state(router_state);
     Ok(router)
 }
@@ -1515,6 +1665,26 @@ fn build_router(
 #[derive(Clone)]
 struct AuthState {
     token: Option<String>,
+}
+
+#[derive(Clone)]
+struct ConcurrencyState {
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+async fn concurrency_middleware(
+    State(state): State<ConcurrencyState>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    let permit = match state.semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    let response = next.run(request).await;
+    drop(permit);
+    response
 }
 
 async fn auth_middleware(
@@ -1547,7 +1717,16 @@ async fn auth_middleware(
 }
 async fn ingest_or_mcp_handler(State(state): State<RouterState>, body: Bytes) -> impl IntoResponse {
     let ingestor = state.app.ingestor();
-    let response = ingestor.handle(&body);
+    let body_for_ingest = body.clone();
+    let response = match tokio::task::spawn_blocking(move || ingestor.handle(body_for_ingest.as_ref()))
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => crate::raymon_ingest::IngestResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            error: Some(format!("ingest task failed: {error}")),
+        },
+    };
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if response.status == 422 && looks_like_mcp_request(&body) {
@@ -1970,8 +2149,10 @@ pub async fn run() -> Result<(), DynError> {
         port = config.port,
         tui_enabled = config.tui_enabled,
         allow_remote = config.allow_remote,
+        allow_insecure_remote = config.allow_insecure_remote,
         max_body_bytes = config.max_body_bytes,
         max_query_len = config.max_query_len,
+        max_entries = config.max_entries,
         jq_timeout_ms = config.jq_timeout_ms,
         auth_enabled = config.auth_token.is_some(),
         ide = ?config.ide,
@@ -1989,7 +2170,7 @@ pub async fn run() -> Result<(), DynError> {
     info!(path = %storage_root.display(), "storage root");
 
     // Archives are file-backed per TUI session; start the live stream empty.
-    let (state, initial_logs) = build_state(&storage_root, false)?;
+    let (state, initial_logs) = build_state(&storage_root, false, config.max_entries)?;
     let (shutdown_tx, _) = broadcast::channel(4);
     let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -2077,6 +2258,7 @@ pub async fn run() -> Result<(), DynError> {
         };
         Some(tokio::spawn(run_tui(
             tui_config,
+            state.core.clone(),
             state.bus.clone(),
             initial_logs,
             shutdown_tx.subscribe(),
@@ -2367,11 +2549,126 @@ mod tests {
         let input = entry_to_storage_input(&entry).expect("storage input");
         storage.append_entry(input).expect("append");
 
-        let (state, logs) = build_state(root, true).expect("build state");
+        let (state, logs) = build_state(root, true, 0).expect("build state");
         let restored = state.core.get(&entry.uuid).expect("get entry");
         assert!(restored.is_some());
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].message, "hello");
+    }
+
+    #[test]
+    fn core_state_preserves_order_on_update() {
+        let core = CoreState::new(0);
+        let filters = Filters::default();
+
+        let screen = Screen::new("proj:host:default");
+
+        for (uuid, received_at) in [("entry-1", 1u64), ("entry-2", 2), ("entry-3", 3)] {
+            let entry = CoreEntry {
+                uuid: uuid.to_string(),
+                received_at,
+                project: "proj".to_string(),
+                host: "host".to_string(),
+                screen: screen.clone(),
+                session_id: None,
+                payloads: vec![crate::raymon_core::Payload {
+                    r#type: "log".to_string(),
+                    content: serde_json::json!({ "message": uuid }),
+                    origin: crate::raymon_core::Origin {
+                        project: "proj".to_string(),
+                        host: "host".to_string(),
+                        screen: Some(screen.clone()),
+                        session_id: None,
+                        function_name: None,
+                        file: None,
+                        line_number: None,
+                    },
+                }],
+            };
+            core.insert(entry).expect("insert");
+        }
+
+        let updated = CoreEntry {
+            uuid: "entry-2".to_string(),
+            received_at: 2,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({ "message": "updated" }),
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen.clone()),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        };
+        core.update(updated).expect("update");
+
+        let uuids: Vec<String> = core
+            .list(&filters)
+            .expect("list")
+            .into_iter()
+            .map(|entry| entry.uuid)
+            .collect();
+        assert_eq!(uuids, vec!["entry-1", "entry-2", "entry-3"]);
+
+        let entry = core.get("entry-2").expect("get").expect("entry-2");
+        let message = entry
+            .payloads
+            .first()
+            .and_then(|payload| payload.content.get("message"))
+            .and_then(|value| value.as_str())
+            .expect("message");
+        assert_eq!(message, "updated");
+    }
+
+    #[test]
+    fn core_state_eviction_removes_oldest_entries() {
+        let core = CoreState::new(2);
+        let filters = Filters::default();
+
+        let screen = Screen::new("proj:host:default");
+        for uuid in ["entry-1", "entry-2", "entry-3"] {
+            let entry = CoreEntry {
+                uuid: uuid.to_string(),
+                received_at: 1,
+                project: "proj".to_string(),
+                host: "host".to_string(),
+                screen: screen.clone(),
+                session_id: None,
+                payloads: vec![crate::raymon_core::Payload {
+                    r#type: "log".to_string(),
+                    content: serde_json::json!({ "message": uuid }),
+                    origin: crate::raymon_core::Origin {
+                        project: "proj".to_string(),
+                        host: "host".to_string(),
+                        screen: Some(screen.clone()),
+                        session_id: None,
+                        function_name: None,
+                        file: None,
+                        line_number: None,
+                    },
+                }],
+            };
+            core.insert(entry).expect("insert");
+        }
+
+        assert!(core.get("entry-1").expect("get").is_none());
+
+        let uuids: Vec<String> = core
+            .list(&filters)
+            .expect("list")
+            .into_iter()
+            .map(|entry| entry.uuid)
+            .collect();
+        assert_eq!(uuids, vec!["entry-2", "entry-3"]);
     }
 
     fn core_entry_with_payload(payload_type: &str, content: Value) -> CoreEntry {
@@ -2475,5 +2772,60 @@ mod tests {
             detail,
             json!({ "method": "GET", "path": "/api", "status": 200, "duration_ms": 7 })
         );
+    }
+
+    #[tokio::test]
+    async fn forwarder_resyncs_when_broadcast_lags() {
+        let core = CoreState::default();
+        let bus = CoreBus::new();
+        let event_rx = bus.subscribe().expect("subscribe");
+
+        let screen = Screen::new("proj:host:default");
+        let entry = CoreEntry {
+            uuid: "entry-1".to_string(),
+            received_at: 1,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({ "message": "hello" }),
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        };
+        core.insert(entry.clone()).expect("insert");
+
+        // Force lag by overflowing the broadcast channel without reading.
+        for _ in 0..256 {
+            bus.emit(CoreEvent::EntryInserted(entry.clone())).expect("emit");
+        }
+
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let forward_handle = tokio::spawn(forward_events_to_ui(event_rx, ui_tx, core, 0));
+
+        let first = tokio::task::spawn_blocking(move || {
+            ui_rx.recv_timeout(Duration::from_secs(1)).expect("ui event")
+        })
+        .await
+        .expect("join");
+
+        match first {
+            UiEvent::Resync { dropped, logs } => {
+                assert!(dropped > 0);
+                assert!(!logs.is_empty());
+            }
+            other => panic!("expected resync ui event, got {other:?}"),
+        }
+
+        forward_handle.abort();
     }
 }

@@ -1,6 +1,9 @@
 use crate::raymon_core::Entry;
 use serde_json::Value;
 
+const BLOB_STRING_LEN_THRESHOLD: usize = 16 * 1024;
+const BLOB_STRING_PLACEHOLDER: &str = "[[raymon:blob redacted]]";
+
 pub fn sanitize_entry(entry: &mut Entry) {
     for payload in &mut entry.payloads {
         sanitize_value(&mut payload.content);
@@ -12,6 +15,9 @@ fn sanitize_value(value: &mut Value) {
         Value::String(text) => {
             if let Some(cleaned) = sanitize_symfony_var_dumper_html(text) {
                 *text = cleaned;
+            }
+            if should_redact_blob_string(text) {
+                *text = BLOB_STRING_PLACEHOLDER.to_string();
             }
         }
         Value::Array(items) => {
@@ -26,6 +32,37 @@ fn sanitize_value(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn should_redact_blob_string(value: &str) -> bool {
+    if value.len() < BLOB_STRING_LEN_THRESHOLD {
+        return false;
+    }
+
+    let trimmed = value.trim();
+    if trimmed.starts_with("data:") && trimmed.contains(";base64,") {
+        return true;
+    }
+
+    looks_like_base64(trimmed)
+}
+
+fn looks_like_base64(value: &str) -> bool {
+    if value.is_empty() || !value.is_ascii() {
+        return false;
+    }
+
+    const SAMPLE_BYTES: usize = 512;
+
+    for &byte in value.as_bytes().iter().take(SAMPLE_BYTES) {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'-' | b'_' | b'=' => {}
+            b'\n' | b'\r' => {}
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 fn sanitize_symfony_var_dumper_html(input: &str) -> Option<String> {
@@ -220,5 +257,59 @@ mod tests {
             .and_then(|value| value.as_str())
             .expect("html value");
         assert_eq!(sanitized, html);
+    }
+
+    #[test]
+    fn redacts_large_base64_strings() {
+        let blob = "A".repeat(super::BLOB_STRING_LEN_THRESHOLD + 8);
+        let mut entry = entry_with_value(&blob);
+        sanitize_entry(&mut entry);
+
+        let sanitized = entry.payloads[0]
+            .content
+            .get("values")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .expect("sanitized value");
+
+        assert_eq!(sanitized, super::BLOB_STRING_PLACEHOLDER);
+    }
+
+    #[test]
+    fn redacts_data_uri_base64_strings() {
+        let blob = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(super::BLOB_STRING_LEN_THRESHOLD + 8)
+        );
+        let mut entry = entry_with_value(&blob);
+        sanitize_entry(&mut entry);
+
+        let sanitized = entry.payloads[0]
+            .content
+            .get("values")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .expect("sanitized value");
+
+        assert_eq!(sanitized, super::BLOB_STRING_PLACEHOLDER);
+    }
+
+    #[test]
+    fn keeps_small_base64_strings() {
+        let blob = "A".repeat(256);
+        let mut entry = entry_with_value(&blob);
+        sanitize_entry(&mut entry);
+
+        let sanitized = entry.payloads[0]
+            .content
+            .get("values")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .expect("sanitized value");
+
+        assert_eq!(sanitized, blob);
     }
 }

@@ -34,6 +34,35 @@ pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSe
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
 const DEFAULT_MAX_QUERY_LEN: usize = 265;
+const MAX_MCP_PEERS: usize = 64;
+
+trait PeerHealth {
+    fn transport_closed(&self) -> bool;
+}
+
+impl PeerHealth for rmcp::Peer<rmcp::RoleServer> {
+    fn transport_closed(&self) -> bool {
+        self.is_transport_closed()
+    }
+}
+
+fn prune_closed_peers<P: PeerHealth>(peers: &mut Vec<P>) {
+    peers.retain(|peer| !peer.transport_closed());
+}
+
+fn enforce_peer_cap<P>(peers: &mut Vec<P>, cap: usize) {
+    if cap == 0 {
+        peers.clear();
+        return;
+    }
+
+    if peers.len() <= cap {
+        return;
+    }
+
+    let overflow = peers.len() - cap;
+    peers.drain(0..overflow);
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpInitError {
@@ -196,7 +225,9 @@ where
 
     async fn register_peer(&self, peer: rmcp::Peer<rmcp::RoleServer>) {
         let mut peers = self.peers.write().await;
+        prune_closed_peers(&mut peers);
         peers.push(peer);
+        enforce_peer_cap(&mut peers, MAX_MCP_PEERS);
     }
 
     fn map_filters(params: &ListEntriesParams) -> Filters {
@@ -601,9 +632,18 @@ async fn broadcast_notification(
     peers: &Arc<RwLock<Vec<rmcp::Peer<rmcp::RoleServer>>>>,
     notification: ServerNotification,
 ) {
-    let peers = peers.read().await.clone();
-    for peer in peers {
-        let _ = peer.send_notification(notification.clone()).await;
+    let peers_snapshot = peers.read().await.clone();
+    let mut had_error = false;
+
+    for peer in peers_snapshot {
+        if peer.send_notification(notification.clone()).await.is_err() {
+            had_error = true;
+        }
+    }
+
+    if had_error {
+        let mut peers = peers.write().await;
+        prune_closed_peers(&mut peers);
     }
 }
 
@@ -616,6 +656,17 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    #[derive(Clone, Debug)]
+    struct MockPeer {
+        closed: bool,
+    }
+
+    impl PeerHealth for MockPeer {
+        fn transport_closed(&self) -> bool {
+            self.closed
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct TestError(String);
 
@@ -626,6 +677,27 @@ mod tests {
     }
 
     impl std::error::Error for TestError {}
+
+    #[test]
+    fn prune_closed_peers_removes_closed_entries() {
+        let mut peers = vec![
+            MockPeer { closed: false },
+            MockPeer { closed: true },
+            MockPeer { closed: false },
+        ];
+
+        prune_closed_peers(&mut peers);
+
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().all(|peer| !peer.closed));
+    }
+
+    #[test]
+    fn enforce_peer_cap_evicts_oldest_entries() {
+        let mut peers = vec![1, 2, 3, 4];
+        enforce_peer_cap(&mut peers, 2);
+        assert_eq!(peers, vec![3, 4]);
+    }
 
     #[derive(Clone)]
     struct TestStore {

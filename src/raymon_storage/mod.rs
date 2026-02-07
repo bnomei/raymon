@@ -7,13 +7,11 @@ use crate::raymon_core::{FilterError as CoreFilterError, Filters as CoreFilters}
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
-mod blobs;
 mod index;
 mod jsonl;
 
 pub const DEFAULT_DATA_DIR: &str = "data";
 pub const ENTRIES_FILE: &str = "entries.jsonl";
-pub const BLOBS_DIR: &str = "blobs";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -42,7 +40,6 @@ pub struct EntryInput {
 #[derive(Debug, Clone)]
 pub enum EntryPayload {
     Text(String),
-    Bytes(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +62,6 @@ pub struct StoredEntry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StoredPayload {
     Text { text: String },
-    Blob { path: String, size: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +119,6 @@ pub struct Storage {
     root: PathBuf,
     data_dir: PathBuf,
     entries_path: PathBuf,
-    blobs_dir: PathBuf,
     index: index::Index,
 }
 
@@ -132,23 +127,17 @@ impl Storage {
         let root = root.as_ref().to_path_buf();
         let data_dir = root.join(DEFAULT_DATA_DIR);
         let entries_path = data_dir.join(ENTRIES_FILE);
-        let blobs_dir = data_dir.join(BLOBS_DIR);
 
         fs::create_dir_all(&data_dir)?;
-        fs::create_dir_all(&blobs_dir)?;
 
         let index = index::rebuild(&entries_path)?;
 
-        Ok(Self { root, data_dir, entries_path, blobs_dir, index })
+        Ok(Self { root, data_dir, entries_path, index })
     }
 
     pub fn append_entry(&mut self, entry: EntryInput) -> Result<OffsetMeta, StorageError> {
         let payload = match entry.payload {
             EntryPayload::Text(text) => StoredPayload::Text { text },
-            EntryPayload::Bytes(bytes) => {
-                let (path, size) = blobs::store_blob(&self.blobs_dir, &bytes)?;
-                StoredPayload::Blob { path, size }
-            }
         };
 
         let stored = StoredEntry {
@@ -206,11 +195,6 @@ impl Storage {
         self.index = index::rebuild(&self.entries_path)?;
         Ok(())
     }
-
-    pub fn store_blob(&self, bytes: &[u8]) -> Result<String, StorageError> {
-        let (path, _) = blobs::store_blob(&self.blobs_dir, bytes)?;
-        Ok(path)
-    }
 }
 
 #[cfg(test)]
@@ -267,7 +251,6 @@ mod tests {
         assert_eq!(entry.id, "entry-1");
         match entry.payload {
             StoredPayload::Text { text } => assert_eq!(text, "payload"),
-            StoredPayload::Blob { .. } => panic!("expected text payload"),
         }
 
         let filter = EntryFilter { screen: Some("home".to_string()), ..EntryFilter::default() };
@@ -314,37 +297,6 @@ mod tests {
 
         let entry = storage.get_entry_by_id("entry-2").expect("get entry").expect("missing entry");
         assert_eq!(entry.summary, "second");
-    }
-
-    #[test]
-    fn append_binary_payload_stores_blob() {
-        let dir = TempDir::new().expect("temp dir");
-        let mut storage = Storage::new(dir.path()).expect("storage");
-
-        let input = EntryInput {
-            id: "entry-blob".to_string(),
-            project: "proj".to_string(),
-            host: "host".to_string(),
-            screen: "home".to_string(),
-            session: "sess-a".to_string(),
-            summary: "blob".to_string(),
-            search_text: "binary".to_string(),
-            types: Vec::new(),
-            colors: Vec::new(),
-            payload: EntryPayload::Bytes(vec![1, 2, 3, 4]),
-        };
-
-        let meta = storage.append_entry(input).expect("append entry");
-        let entry = storage.get_entry_by_offset(meta.offset, meta.len).expect("read entry");
-
-        match entry.payload {
-            StoredPayload::Blob { path, size } => {
-                assert_eq!(size, 4);
-                let full_path = storage.data_dir().join(path);
-                assert!(full_path.exists());
-            }
-            StoredPayload::Text { .. } => panic!("expected blob payload"),
-        }
     }
 
     #[rstest]
@@ -532,6 +484,34 @@ mod tests {
 
         let result = storage.list_entries_core(&filters);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_entries_core_regex_is_case_insensitive() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut storage = Storage::new(dir.path()).expect("storage");
+
+        let input = EntryInput {
+            id: "entry-case".to_string(),
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: "home".to_string(),
+            session: "sess-a".to_string(),
+            summary: "Hello Core".to_string(),
+            search_text: "Hello Core log".to_string(),
+            types: Vec::new(),
+            colors: Vec::new(),
+            payload: EntryPayload::Text("{}".to_string()),
+        };
+        storage.append_entry(input).expect("append entry");
+
+        let mut filters = CoreFilters::default();
+        filters.query = Some("hello".to_string());
+        filters.query_is_regex = true;
+
+        let listed = storage.list_entries_core(&filters).expect("list core entries");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id.as_str(), "entry-case");
     }
 
     #[test]

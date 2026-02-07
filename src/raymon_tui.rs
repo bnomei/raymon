@@ -624,9 +624,14 @@ struct LiveBuffer {
     queued: Vec<LogEntry>,
 }
 
+const LIVE_ARCHIVE_FLUSH_EVERY_ENTRIES: usize = 64;
+const LIVE_ARCHIVE_FLUSH_EVERY_MS: u64 = 1_000;
+
 struct LiveArchive {
     path: PathBuf,
     writer: BufWriter<std::fs::File>,
+    writes_since_flush: usize,
+    last_flush_at: Instant,
 }
 
 /// Main TUI container.
@@ -727,6 +732,24 @@ impl Tui {
         tui
     }
 
+    pub fn resync_live_logs(&mut self, logs: Vec<LogEntry>, notice: String) {
+        if self.viewing_archive.is_some() {
+            let live = self.live_buffer.get_or_insert_with(LiveBuffer::default);
+            live.logs = logs;
+            live.queued.clear();
+            self.state.detail_notice = Some(notice);
+            return;
+        }
+
+        self.state.logs = logs;
+        self.state.queued.clear();
+        self.rebuild_screens();
+        self.detail_cache = None;
+        self.state.last_detail_search = None;
+        self.recompute_filter();
+        self.state.detail_notice = Some(notice);
+    }
+
     fn tick_events_per_min(&mut self, now: Instant) {
         const BUCKET_SECS: u64 = 10;
         const BUCKETS: usize = 6;
@@ -785,7 +808,12 @@ impl Tui {
     fn create_live_archive(&self, dir: &Path) -> Result<LiveArchive, std::io::Error> {
         let stamp = archive_stamp(Utc::now());
         let (path, file) = create_unique_jsonl_file(dir, &stamp)?;
-        Ok(LiveArchive { path, writer: BufWriter::new(file) })
+        Ok(LiveArchive {
+            path,
+            writer: BufWriter::new(file),
+            writes_since_flush: 0,
+            last_flush_at: Instant::now(),
+        })
     }
 
     fn refresh_archives(&mut self) {
@@ -864,10 +892,20 @@ impl Tui {
             return;
         };
 
+        let now = Instant::now();
         let write_result = (|| {
             serde_json::to_writer(&mut live.writer, entry)?;
             live.writer.write_all(b"\n")?;
-            live.writer.flush()?;
+            live.writes_since_flush = live.writes_since_flush.saturating_add(1);
+
+            let should_flush = live.writes_since_flush >= LIVE_ARCHIVE_FLUSH_EVERY_ENTRIES
+                || now.duration_since(live.last_flush_at)
+                    >= Duration::from_millis(LIVE_ARCHIVE_FLUSH_EVERY_MS);
+            if should_flush {
+                live.writer.flush()?;
+                live.writes_since_flush = 0;
+                live.last_flush_at = now;
+            }
             Ok::<(), Box<dyn std::error::Error>>(())
         })();
 
@@ -875,6 +913,34 @@ impl Tui {
             self.state.detail_notice = Some(format!("live archive write failed: {err}"));
             self.live_archive = None;
         }
+    }
+
+    fn flush_live_archive(&mut self) {
+        let flush_result = match self.live_archive.as_mut() {
+            Some(live) => {
+                if live.writes_since_flush == 0 {
+                    return;
+                }
+
+                let result = live.writer.flush();
+                if result.is_ok() {
+                    live.writes_since_flush = 0;
+                    live.last_flush_at = Instant::now();
+                }
+                result
+            }
+            None => return,
+        };
+
+        if let Err(err) = flush_result {
+            self.state.detail_notice = Some(format!("live archive flush failed: {err}"));
+            self.live_archive = None;
+        }
+    }
+
+    fn quit(&mut self) -> Action {
+        self.flush_live_archive();
+        Action::Quit
     }
 
     fn bump_live_archive_count(&mut self) {
@@ -1010,7 +1076,7 @@ impl Tui {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') | KeyCode::Char('C') => return Action::Quit,
+                KeyCode::Char('c') | KeyCode::Char('C') => return self.quit(),
                 _ => {}
             }
         }
@@ -1033,7 +1099,7 @@ impl Tui {
                 KeyEvent { code: KeyCode::Char('q' | 'Q'), modifiers, .. }
                     if !modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    return Action::Quit;
+                    return self.quit();
                 }
                 KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::NONE, .. }
                 | KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. } => {
@@ -1794,7 +1860,7 @@ impl Tui {
             KeyEvent { code: KeyCode::Char('q' | 'Q'), modifiers, .. }
                 if !modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                Action::Quit
+                self.quit()
             }
             KeyEvent { code: KeyCode::Char('/'), modifiers: KeyModifiers::NONE, .. } => {
                 self.state.mode = Mode::Search;
@@ -5590,6 +5656,47 @@ mod tests {
         assert_eq!(expanded_blob, collapsed_blob);
         assert!(expanded_display_lines > 1);
         assert_eq!(collapsed_display_lines, 1);
+    }
+
+    #[test]
+    fn live_archive_batches_flushes() {
+        let dir = tempdir().expect("tempdir");
+        let mut config = TuiConfig::default();
+        config.archive_dir = Some(dir.path().to_path_buf());
+
+        let value = Arc::new(Mutex::new(String::new()));
+        let clipboard = MockClipboard { value };
+        let mut tui = Tui::with_clipboard(config, Box::new(clipboard));
+
+        let live_path = tui
+            .live_archive
+            .as_ref()
+            .map(|live| live.path.clone())
+            .expect("live archive");
+        assert_eq!(fs::metadata(&live_path).expect("metadata").len(), 0);
+
+        let entry = LogEntry {
+            id: 1,
+            uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+            message: "alpha".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        };
+
+        tui.append_to_live_archive(&entry);
+        assert_eq!(fs::metadata(&live_path).expect("metadata").len(), 0);
+
+        for _ in 1..LIVE_ARCHIVE_FLUSH_EVERY_ENTRIES {
+            tui.append_to_live_archive(&entry);
+        }
+
+        assert!(fs::metadata(&live_path).expect("metadata").len() > 0);
     }
 
     #[rstest]
