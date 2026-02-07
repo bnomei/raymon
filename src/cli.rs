@@ -55,7 +55,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 7777;
+// Match the official Ray apps & clients default.
+const DEFAULT_PORT: u16 = 23517;
 const DEFAULT_TUI_ENABLED: bool = true;
 const SUMMARY_LIMIT: usize = 160;
 const TUI_TICK_MS: u64 = 50;
@@ -1941,7 +1942,8 @@ async fn run_demo(
 }
 
 pub async fn run() -> Result<(), DynError> {
-    tracing_subscriber::fmt::init();
+    // Important: MCP stdio uses stdout for the protocol, so always log to stderr.
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let cli = Cli::parse();
     let cwd = env::current_dir()?;

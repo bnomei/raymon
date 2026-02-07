@@ -138,20 +138,48 @@ where
         })?;
         validate_envelope(&envelope)?;
 
-        let entry = envelope.into_entry((self.clock)());
+        let mut entry = envelope.into_entry((self.clock)());
 
         let existing = self.state.get_entry(&entry.uuid).map_err(IngestError::StateStore)?;
 
-        self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
-        if existing.is_some() {
+        if let Some(existing) = existing {
+            entry = merge_entry_update(existing, entry);
+            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
             self.bus.emit(Event::EntryUpdated(entry.clone())).map_err(IngestError::EventBus)?;
         } else {
+            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.insert_entry(entry.clone()).map_err(IngestError::StateStore)?;
             self.bus.emit(Event::EntryInserted(entry.clone())).map_err(IngestError::EventBus)?;
         }
 
         Ok(entry)
+    }
+}
+
+fn merge_entry_update(existing: Entry, update: Entry) -> Entry {
+    let mut payloads = existing.payloads;
+    payloads.extend(update.payloads);
+
+    let project = if existing.project.trim().is_empty() || existing.project == "unknown" {
+        update.project
+    } else {
+        existing.project
+    };
+    let host = if existing.host.trim().is_empty() || existing.host == "unknown" {
+        update.host
+    } else {
+        existing.host
+    };
+
+    Entry {
+        uuid: existing.uuid,
+        received_at: existing.received_at,
+        project,
+        host,
+        screen: existing.screen,
+        session_id: existing.session_id.or(update.session_id),
+        payloads,
     }
 }
 
@@ -387,15 +415,20 @@ mod tests {
     ) {
         let ingestor = ingestor(&state, &storage, &bus);
         let body = serde_json::to_vec(&envelope).unwrap();
+        let uuid = envelope["uuid"].as_str().unwrap();
 
         assert_eq!(ingestor.handle(&body).status, 200);
         assert_eq!(ingestor.handle(&body).status, 200);
 
         let stored = storage.entries.lock().unwrap();
         assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].payloads.len(), 1);
+        assert_eq!(stored[1].payloads.len(), 2);
 
         let state_entries = state.entries.lock().unwrap();
         assert_eq!(state_entries.len(), 1);
+        assert_eq!(state_entries[0].uuid, uuid);
+        assert_eq!(state_entries[0].payloads.len(), 2);
 
         let events = bus.events.lock().unwrap();
         assert_eq!(events.len(), 2);

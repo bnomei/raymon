@@ -41,12 +41,12 @@ raymon --demo
 
 Raymon supports MCP over:
 - **stdio (local)** via `raymon mcp`
-- **Streamable HTTP (remote)** via `http://<host>:<port>/mcp` (default: `http://127.0.0.1:7777/mcp`)
+- **Streamable HTTP (remote)** via `http://<host>:<port>/mcp` (default: `http://127.0.0.1:23517/mcp`)
 
 #### Local (stdio)
 
 In stdio mode, Raymon still starts the HTTP ingest endpoint on `RAYMON_HOST`/`RAYMON_PORT`
-(default `127.0.0.1:7777`), but MCP runs over stdio for your MCP client.
+(default `127.0.0.1:23517`), but MCP runs over stdio for your MCP client.
 This mode runs without the TUI (stdout is reserved for MCP).
 
 Add it to your MCP client:
@@ -79,14 +79,14 @@ RAYMON_ALLOW_REMOTE=1 RAYMON_HOST=0.0.0.0 RAYMON_NO_TUI=1 RAYMON_AUTH_TOKEN="$RA
 
 2) Add it to your MCP client:
 ```bash
-codex mcp add raymon --url http://<host>:7777/mcp --bearer-token-env-var RAYMON_AUTH_TOKEN
+codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON_AUTH_TOKEN
 ```
 
 ```json
 {
   "mcpServers": {
     "raymon": {
-      "url": "http://<host>:7777/mcp"
+      "url": "http://<host>:23517/mcp"
     }
   }
 }
@@ -266,7 +266,7 @@ Raymon is configured primarily via environment variables:
 | --- | --- | --- |
 | `RAYMON_ENABLED` | `true` | Enable/disable the server. |
 | `RAYMON_HOST` | `127.0.0.1` | Bind address for the HTTP server. |
-| `RAYMON_PORT` | `7777` | Bind port for the HTTP server. |
+| `RAYMON_PORT` | `23517` | Bind port for the HTTP server. |
 | `RAYMON_TUI` | `true` | Enable the TUI. |
 | `RAYMON_NO_TUI` | `false` | Disable the TUI (takes precedence over `RAYMON_TUI`). |
 | `RAYMON_IDE` | `code` | IDE command used for “open origin” (for VS Code line jumps, use `code --goto`). |
