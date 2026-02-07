@@ -7,5 +7,6 @@ mod raymon_ingest;
 mod raymon_mcp;
 mod raymon_storage;
 mod raymon_tui;
+mod sanitize;
 
 pub use cli::{run, DynError};

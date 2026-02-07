@@ -142,8 +142,16 @@ where
 
         let existing = self.state.get_entry(&entry.uuid).map_err(IngestError::StateStore)?;
 
-        if let Some(existing) = existing {
+        let update = if let Some(existing) = existing {
             entry = merge_entry_update(existing, entry);
+            true
+        } else {
+            false
+        };
+
+        crate::sanitize::sanitize_entry(&mut entry);
+
+        if update {
             self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
             self.bus.emit(Event::EntryUpdated(entry.clone())).map_err(IngestError::EventBus)?;

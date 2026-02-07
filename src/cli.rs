@@ -515,7 +515,7 @@ fn restore_from_storage(
             }
         };
 
-        let core_entry = match stored.payload {
+        let mut core_entry = match stored.payload {
             StoredPayload::Text { text } => match serde_json::from_str::<CoreEntry>(&text) {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -532,6 +532,8 @@ fn restore_from_storage(
                 continue;
             }
         };
+
+        crate::sanitize::sanitize_entry(&mut core_entry);
 
         let log_entry = collect_logs.then(|| log_entry_from_core(&core_entry));
         let is_first = seen.insert(core_entry.uuid.clone());
