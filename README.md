@@ -12,7 +12,7 @@ Stateful HTTP ingest + MCP server + terminal UI for Ray-style logs.
 Raymon is:
 - CLI-first: one binary, local-first defaults.
 - MCP-first: a small set of tools with explicit schemas for agents/LLMs.
-- Keyboard-first: a Ratatui TUI designed for fast filtering, yanking, navigation and export.
+- Keyboard-first: a [Ratatui](https://ratatui.rs) TUI designed for fast filtering, yanking, navigation and export.
 
 <a title="click to open" target="_blank" style="cursor: zoom-in;" href="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png"><img src="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png" alt="screenshot" style="width: 100%;" /></a>
 
