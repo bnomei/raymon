@@ -108,9 +108,9 @@ fn ingest_new_object(bencher: divan::Bencher, payload_count: usize) {
         }),
     );
 
-    let state = NoopState::default();
+    let state = NoopState;
     let storage = NoopStorage::default();
-    let bus = NoopBus::default();
+    let bus = NoopBus;
     let ingestor = Ingestor::new(&state, &storage, &bus, fixed_clock);
 
     bencher.bench(|| {
@@ -124,9 +124,9 @@ fn ingest_new_blob_redaction(bencher: divan::Bencher) {
     let blob = format!("data:text/plain;base64,{}", "A".repeat(32 * 1024));
     let body = make_body(1, Value::String(blob));
 
-    let state = NoopState::default();
+    let state = NoopState;
     let storage = NoopStorage::default();
-    let bus = NoopBus::default();
+    let bus = NoopBus;
     let ingestor = Ingestor::new(&state, &storage, &bus, fixed_clock);
 
     bencher.bench(|| {
@@ -146,9 +146,9 @@ fn ingest_new_symfony_html_strip(bencher: divan::Bencher) {
 </pre><script>Sfdump(\"sf-dump-1\")</script>"#;
     let body = make_body(1, Value::String(dump.to_string()));
 
-    let state = NoopState::default();
+    let state = NoopState;
     let storage = NoopStorage::default();
-    let bus = NoopBus::default();
+    let bus = NoopBus;
     let ingestor = Ingestor::new(&state, &storage, &bus, fixed_clock);
 
     bencher.bench(|| {
@@ -173,7 +173,7 @@ fn ingest_update_merge_payloads(bencher: divan::Bencher) {
     let existing = envelope.clone().into_entry(fixed_clock());
     let state = FixedState { entry: existing };
     let storage = NoopStorage::default();
-    let bus = NoopBus::default();
+    let bus = NoopBus;
     let ingestor = Ingestor::new(&state, &storage, &bus, fixed_clock);
 
     bencher.bench(|| {
