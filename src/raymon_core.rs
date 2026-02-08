@@ -1,38 +1,49 @@
 //! Core domain types and traits for Raymon.
+//!
+//! This module is intentionally IO-free and is shared across the HTTP ingest, storage, MCP and TUI
+//! layers.
 
 pub mod types {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    /// Milliseconds since the UNIX epoch.
     pub type Timestamp = u64;
 
+    /// Logical screen name used to group entries (as shown in the TUI).
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct Screen(pub String);
 
     impl Screen {
+        /// Create a new screen name.
         pub fn new(name: impl Into<String>) -> Self {
             Self(name.into())
         }
 
+        /// Borrow the underlying string.
         pub fn as_str(&self) -> &str {
             &self.0
         }
     }
 
+    /// Optional session identifier associated with a set of payloads.
     #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct SessionId(pub String);
 
     impl SessionId {
+        /// Create a new session id.
         pub fn new(value: impl Into<String>) -> Self {
             Self(value.into())
         }
 
+        /// Borrow the underlying string.
         pub fn as_str(&self) -> &str {
             &self.0
         }
     }
 
+    /// Origin metadata describing where a payload came from.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Origin {
         pub project: String,
@@ -48,11 +59,13 @@ pub mod types {
     }
 
     impl Origin {
+        /// Return the explicit screen name or a deterministic default.
         pub fn screen_or_default(&self) -> Screen {
             self.screen.clone().unwrap_or_else(|| default_screen_name(&self.project, &self.host))
         }
     }
 
+    /// Resolved entry metadata derived from an [`Origin`] or Ray meta fields.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct EntryMeta {
         pub project: String,
@@ -63,6 +76,7 @@ pub mod types {
     }
 
     impl EntryMeta {
+        /// Construct metadata directly.
         pub fn new(
             project: impl Into<String>,
             host: impl Into<String>,
@@ -73,6 +87,7 @@ pub mod types {
             Self { project: project.into(), host: host.into(), screen, session_id, received_at }
         }
 
+        /// Derive metadata from a single [`Origin`].
         pub fn from_origin(origin: &Origin, received_at: Timestamp) -> Self {
             Self {
                 project: origin.project.clone(),
@@ -83,6 +98,8 @@ pub mod types {
             }
         }
 
+        /// Derive metadata from a list of payloads (using the first payload as the source of
+        /// origin information).
         pub fn from_payloads(payloads: &[Payload], received_at: Timestamp) -> Self {
             if let Some(origin) = payloads.first().map(|payload| &payload.origin) {
                 return Self::from_origin(origin, received_at);
@@ -100,6 +117,7 @@ pub mod types {
             }
         }
 
+        /// Derive metadata from the Ray meta block and payload origins.
         pub fn from_ray(
             meta: Option<&RayMeta>,
             payloads: &[RayPayload],
@@ -128,6 +146,7 @@ pub mod types {
         }
     }
 
+    /// Origin fields as sent by Ray clients.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct RayOrigin {
         #[serde(default, alias = "functionName")]
@@ -140,6 +159,7 @@ pub mod types {
         pub hostname: String,
     }
 
+    /// Single Ray payload item.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct RayPayload {
         #[serde(rename = "type")]
@@ -148,6 +168,7 @@ pub mod types {
         pub origin: RayOrigin,
     }
 
+    /// Optional metadata block carried by Ray envelopes.
     #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
     pub struct RayMeta {
         #[serde(default, alias = "projectName", alias = "project_name")]
@@ -160,6 +181,7 @@ pub mod types {
         pub session_id: Option<SessionId>,
     }
 
+    /// Ray envelope as received over HTTP.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct RayEnvelope {
         pub uuid: String,
@@ -169,10 +191,12 @@ pub mod types {
     }
 
     impl RayEnvelope {
+        /// Resolve the entry metadata for this envelope.
         pub fn entry_meta(&self, received_at: Timestamp) -> EntryMeta {
             EntryMeta::from_ray(self.meta.as_ref(), &self.payloads, received_at)
         }
 
+        /// Convert the Ray envelope into a normalized [`Entry`].
         pub fn into_entry(self, received_at: Timestamp) -> Entry {
             let meta = EntryMeta::from_ray(self.meta.as_ref(), &self.payloads, received_at);
             let payloads = self
@@ -205,6 +229,7 @@ pub mod types {
         }
     }
 
+    /// Normalized payload shape used throughout Raymon.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct Payload {
         #[serde(rename = "type")]
@@ -214,11 +239,13 @@ pub mod types {
     }
 
     impl Payload {
+        /// Return the explicit screen name or a deterministic default.
         pub fn screen_or_default(&self) -> Screen {
             self.origin.screen_or_default()
         }
     }
 
+    /// Internal envelope shape (Raymon-native payloads + optional metadata).
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct Envelope {
         pub uuid: String,
@@ -228,6 +255,7 @@ pub mod types {
     }
 
     impl Envelope {
+        /// Resolve the entry metadata for this envelope.
         pub fn entry_meta(&self, received_at: Timestamp) -> EntryMeta {
             if let Some(meta) = &self.meta {
                 return meta.clone();
@@ -235,6 +263,7 @@ pub mod types {
             EntryMeta::from_payloads(&self.payloads, received_at)
         }
 
+        /// Convert the envelope into an [`Entry`], filling missing metadata.
         pub fn into_entry(self, received_at: Timestamp) -> Entry {
             let meta = EntryMeta::from_payloads(&self.payloads, received_at);
             Entry {
@@ -249,6 +278,7 @@ pub mod types {
         }
     }
 
+    /// A stored log entry (identified by UUID) containing one or more payloads.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct Entry {
         pub uuid: String,
@@ -261,6 +291,7 @@ pub mod types {
     }
 
     impl Entry {
+        /// Return a standalone metadata block for the entry.
         pub fn meta(&self) -> EntryMeta {
             EntryMeta {
                 project: self.project.clone(),
@@ -271,6 +302,7 @@ pub mod types {
             }
         }
 
+        /// Create an entry from a normalized envelope and a receive timestamp.
         pub fn from_envelope(envelope: Envelope, received_at: Timestamp) -> Self {
             let meta = envelope.entry_meta(received_at);
             Self {
@@ -285,16 +317,19 @@ pub mod types {
         }
     }
 
+    /// Derive the default screen name for `project` and `host`.
     pub fn default_screen_name(project: &str, host: &str) -> Screen {
         Screen::new(format!("{project}:{host}:default"))
     }
 
+    /// Convert a system time to a millisecond [`Timestamp`].
     pub fn timestamp_from_system_time(time: SystemTime) -> Timestamp {
         let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
         let millis = duration.as_millis();
         u64::try_from(millis).unwrap_or(u64::MAX)
     }
 
+    /// Convert a millisecond [`Timestamp`] to a system time.
     pub fn system_time_from_timestamp(timestamp: Timestamp) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(timestamp)
     }
@@ -319,6 +354,14 @@ pub mod filters {
     const VALUE_STACK_INLINE: usize = 16;
     type ValueStack<'a> = SmallVec<[&'a Value; VALUE_STACK_INLINE]>;
 
+    /// Query and facet filters for matching entries and payloads.
+    ///
+    /// - `query` matches against payload `type` and recursively against JSON keys/values in
+    ///   `content` (plain substring or `/regex/`).
+    /// - `query_is_regex` forces regex parsing even without `/.../` delimiters.
+    /// - `types` filters payloads by their `type` field.
+    /// - `colors` filters payloads by Ray's canonical color names (`red`, `green`, ...).
+    /// - `limit` and `offset` provide simple pagination.
     #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
     pub struct Filters {
         pub query: Option<String>,
@@ -345,6 +388,14 @@ pub mod filters {
         ) -> Result<Vec<&'a Entry>, FilterError> {
             let query = self.compile_query()?;
             Ok(self.apply_with_query(entries, query.as_ref()))
+        }
+
+        pub fn apply_with_count<'a>(
+            &self,
+            entries: impl IntoIterator<Item = &'a Entry>,
+        ) -> Result<(Vec<&'a Entry>, usize), FilterError> {
+            let query = self.compile_query()?;
+            Ok(self.apply_with_query_and_count(entries, query.as_ref()))
         }
 
         pub fn apply_parallel<'a>(
@@ -392,7 +443,7 @@ pub mod filters {
                     }
                 }
 
-                return Ok(matched);
+                Ok(matched)
             }
 
             #[cfg(not(feature = "rayon"))]
@@ -429,6 +480,39 @@ pub mod filters {
             }
 
             matched
+        }
+
+        fn apply_with_query_and_count<'a>(
+            &self,
+            entries: impl IntoIterator<Item = &'a Entry>,
+            query: Option<&QueryMatcher>,
+        ) -> (Vec<&'a Entry>, usize) {
+            let mut matched = Vec::new();
+            let mut skipped = 0usize;
+            let mut count = 0usize;
+
+            for entry in entries {
+                if !self.matches_entry_with_query(entry, query) {
+                    continue;
+                }
+
+                count += 1;
+
+                if skipped < self.offset {
+                    skipped += 1;
+                    continue;
+                }
+
+                if let Some(limit) = self.limit {
+                    if matched.len() >= limit {
+                        continue;
+                    }
+                }
+
+                matched.push(entry);
+            }
+
+            (matched, count)
         }
 
         fn matches_entry_with_query(&self, entry: &Entry, query: Option<&QueryMatcher>) -> bool {
@@ -740,6 +824,7 @@ pub mod filters {
         Regex(Regex),
     }
 
+    /// Errors returned by [`Filters`] operations.
     #[derive(Debug, Error)]
     pub enum FilterError {
         #[error("invalid regex pattern `{pattern}`: {message}")]
@@ -751,6 +836,7 @@ pub mod state {
     use super::filters::Filters;
     use super::types::{Entry, Screen};
 
+    /// Mutable state store for live entries, screens and clearing operations.
     pub trait StateStore {
         type Error;
 
@@ -758,6 +844,17 @@ pub mod state {
         fn update_entry(&mut self, entry: Entry) -> Result<(), Self::Error>;
         fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, Self::Error>;
         fn list_entries(&self, filters: &Filters) -> Result<Vec<Entry>, Self::Error>;
+        fn list_entries_with_count(
+            &self,
+            filters: &Filters,
+        ) -> Result<(Vec<Entry>, usize), Self::Error> {
+            let mut count_filters = filters.clone();
+            count_filters.limit = None;
+            count_filters.offset = 0;
+            let count = self.list_entries(&count_filters)?.len();
+            let entries = self.list_entries(filters)?;
+            Ok((entries, count))
+        }
         fn list_screens(&self) -> Result<Vec<Screen>, Self::Error>;
         fn clear_screen(&mut self, screen: &Screen) -> Result<(), Self::Error>;
         fn clear_all(&mut self) -> Result<(), Self::Error>;
@@ -768,6 +865,7 @@ pub mod events {
     use super::types::{Entry, Screen};
     use serde::{Deserialize, Serialize};
 
+    /// Domain events emitted when Raymon's state changes.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub enum Event {
         EntryInserted(Entry),
@@ -776,6 +874,7 @@ pub mod events {
         StateCleared,
     }
 
+    /// Publish/subscribe interface for [`Event`]s.
     pub trait EventBus {
         type Error;
         type Subscription;
@@ -788,9 +887,7 @@ pub mod events {
 pub use events::{Event, EventBus};
 pub use filters::{FilterError, Filters};
 pub use state::StateStore;
-pub use types::{
-    Entry, Origin, Payload, RayEnvelope, RayMeta, RayOrigin, RayPayload, Screen,
-};
+pub use types::{Entry, Origin, Payload, RayEnvelope, RayMeta, RayOrigin, RayPayload, Screen};
 
 #[cfg(test)]
 mod tests {
@@ -862,10 +959,12 @@ mod tests {
 
     #[rstest]
     fn filters_match_payload_constraints(entry_with_payloads: Entry) {
-        let mut filters = Filters::default();
-        filters.query = Some("hello".to_string());
-        filters.types = vec!["note".to_string()];
-        filters.colors = vec!["red".to_string()];
+        let mut filters = Filters {
+            query: Some("hello".to_string()),
+            types: vec!["note".to_string()],
+            colors: vec!["red".to_string()],
+            ..Default::default()
+        };
         assert!(filters.matches_entry(&entry_with_payloads).unwrap());
 
         filters.types = vec!["log".to_string()];
@@ -887,26 +986,46 @@ mod tests {
         #[case] query: &str,
         #[case] is_regex: bool,
     ) {
-        let mut filters = Filters::default();
-        filters.query = Some(query.to_string());
-        filters.query_is_regex = is_regex;
+        let filters = Filters {
+            query: Some(query.to_string()),
+            query_is_regex: is_regex,
+            ..Default::default()
+        };
         assert!(filters.matches_entry(&entry_with_payloads).unwrap());
     }
 
     #[rstest]
     fn invalid_regex_returns_error(entry_with_payloads: Entry) {
-        let mut filters = Filters::default();
-        filters.query = Some("/[a-/".to_string());
+        let filters = Filters { query: Some("/[a-/".to_string()), ..Default::default() };
 
         let result = filters.apply(std::iter::once(&entry_with_payloads));
         assert!(matches!(result, Err(FilterError::InvalidRegex { .. })));
     }
 
     #[rstest]
+    fn apply_with_count_returns_total_matches(entry_with_payloads: Entry) {
+        let mut entries =
+            [entry_with_payloads.clone(), entry_with_payloads.clone(), entry_with_payloads];
+        entries[0].uuid = "entry-a".to_string();
+        entries[1].uuid = "entry-b".to_string();
+        entries[2].uuid = "entry-c".to_string();
+
+        let filters = Filters { offset: 1, limit: Some(1), ..Default::default() };
+
+        let (page, count) = filters.apply_with_count(entries.iter()).unwrap();
+
+        assert_eq!(count, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].uuid, "entry-b");
+    }
+
+    #[rstest]
     fn parallel_apply_matches_sequential(entry_with_payloads: Entry) {
-        let mut filters = Filters::default();
-        filters.query = Some("hello".to_string());
-        filters.types = vec!["note".to_string()];
+        let filters = Filters {
+            query: Some("hello".to_string()),
+            types: vec!["note".to_string()],
+            ..Default::default()
+        };
 
         let entries = vec![entry_with_payloads.clone(), entry_with_payloads];
         let sequential = filters.apply(entries.iter()).unwrap();

@@ -6,10 +6,12 @@ license = "MIT"
 rust-version = "1.70"
 description = "Stateful MCP server and TUI for Ray-style logs"
 readme = "README.md"
-homepage = ""
-repository = ""
+homepage = "https://github.com/bnomei/raymon"
+repository = "https://github.com/bnomei/raymon"
+documentation = "https://docs.rs/raymon"
 keywords = ["mcp", "tui", "logging", "observability", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = [".DS_Store", "specs/**"]
 
 [dependencies]
 arboard = "3"
@@ -18,7 +20,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 itoa = "1.0.17"
-memchr = "2.7.6"
+memchr = "2.8.0"
 ratatui = "0.28"
 rapidfuzz = "0.5"
 rayon = { version = "1", optional = true }
@@ -56,4 +58,8 @@ harness = false
 
 [[bench]]
 name = "raymon_storage_perf"
+harness = false
+
+[[bench]]
+name = "raymon_ingest_perf"
 harness = false

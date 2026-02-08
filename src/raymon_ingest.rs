@@ -3,23 +3,32 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::raymon_core::{Entry, Event, RayEnvelope};
+
+/// Response returned by [`Ingestor::handle`].
+///
+/// `status` is an HTTP status code. `error` is a human-readable message (when present).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestResponse {
+    /// HTTP status code (e.g. `200`, `400`, `422`, `500`).
     pub status: u16,
+    /// Human-readable error message (present for non-2xx responses).
     pub error: Option<String>,
 }
 
 impl IngestResponse {
+    /// Successful ingest response.
     pub fn ok() -> Self {
         Self { status: 200, error: None }
     }
 
+    /// Convert an [`IngestError`] into an HTTP-friendly status and message.
     pub fn from_error(error: IngestError) -> Self {
         let status = error.status_code();
         Self { status, error: Some(error.to_string()) }
     }
 }
 
+/// Errors that can occur while parsing and persisting an inbound Ray envelope.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("invalid json: {0}")]
@@ -37,6 +46,7 @@ pub enum IngestError {
 }
 
 impl IngestError {
+    /// Map the ingest error to an HTTP status code.
     pub fn status_code(&self) -> u16 {
         match self {
             Self::InvalidJson(_) => 400,
@@ -46,6 +56,10 @@ impl IngestError {
     }
 }
 
+/// Minimal state-store API needed by [`Ingestor`].
+///
+/// This trait exists to keep the ingest pipeline decoupled from concrete storage/state
+/// implementations and to make testing easier.
 pub trait StateStore {
     fn insert_entry(&self, entry: Entry) -> Result<(), String>;
     fn update_entry(&self, entry: Entry) -> Result<(), String>;
@@ -69,6 +83,7 @@ where
     }
 }
 
+/// Append-only storage API needed by [`Ingestor`].
 pub trait Storage {
     fn append_entry(&self, entry: &Entry) -> Result<(), String>;
 }
@@ -82,6 +97,7 @@ where
     }
 }
 
+/// Event bus API used by [`Ingestor`] to notify subscribers of state changes.
 pub trait EventBus {
     fn emit(&self, event: Event) -> Result<(), String>;
 }
@@ -95,6 +111,14 @@ where
     }
 }
 
+/// Ingest pipeline for Ray-compatible JSON envelopes.
+///
+/// The ingestor:
+/// - Parses the request body into a [`RayEnvelope`].
+/// - Validates required fields.
+/// - Sanitizes payload content.
+/// - Inserts or updates the entry in the [`StateStore`] and [`Storage`].
+/// - Emits an [`Event`] on the [`EventBus`].
 pub struct Ingestor<S, T, B, C> {
     state: S,
     storage: T,
@@ -109,10 +133,14 @@ where
     B: EventBus,
     C: Fn() -> u64,
 {
+    /// Create a new ingestor.
+    ///
+    /// `clock` returns a `u64` timestamp in milliseconds since the UNIX epoch.
     pub fn new(state: S, storage: T, bus: B, clock: C) -> Self {
         Self { state, storage, bus, clock }
     }
 
+    /// Handle a raw HTTP request body and return an [`IngestResponse`].
     pub fn handle(&self, body: &[u8]) -> IngestResponse {
         match self.handle_inner(body) {
             Ok(_) => IngestResponse::ok(),
@@ -120,6 +148,7 @@ where
         }
     }
 
+    /// Parse and process the request body and return the resulting [`Entry`].
     pub fn handle_inner(&self, body: &[u8]) -> Result<Entry, IngestError> {
         let envelope: RayEnvelope = serde_json::from_slice(body).map_err(|err| {
             use serde_json::error::Category;
@@ -202,6 +231,9 @@ fn validate_envelope(envelope: &RayEnvelope) -> Result<(), IngestError> {
     Ok(())
 }
 
+/// Current time as milliseconds since the UNIX epoch.
+///
+/// Returns `0` if the system clock is before the UNIX epoch or otherwise fails.
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

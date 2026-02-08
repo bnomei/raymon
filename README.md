@@ -1,81 +1,89 @@
 # raymon
 
+[![Crates.io Version](https://img.shields.io/crates/v/raymon)](https://crates.io/crates/raymon)
+[![CI](https://img.shields.io/github/actions/workflow/status/bnomei/tmux-mcp/ci.yml?branch=main)](https://github.com/bnomei/tmux-mcp/actions/workflows/ci.yml)
+[![Crates.io Downloads](https://img.shields.io/crates/d/raymon)](https://crates.io/crates/raymon)
+[![License](https://img.shields.io/crates/l/raymon)](https://crates.io/crates/raymon)
+[![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
+[![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
+
 Stateful HTTP ingest + MCP server + terminal UI for Ray-style logs.
 
 Raymon is:
 - CLI-first: one binary, local-first defaults.
 - MCP-first: a small set of tools with explicit schemas for agents/LLMs.
-- Keyboard-first: a Ratatui TUI designed for fast filtering, yanking, and navigation.
+- Keyboard-first: a Ratatui TUI designed for fast filtering, yanking, navigation and export.
 
-## Development Notes
+<a title="click to open" target="_blank" style="cursor: zoom-in;" href="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png"><img src="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png" alt="screenshot" style="width: 100%;" /></a>
 
-The source of truth is the root crate (`Cargo.toml` + `src/*`).
+## Installation
 
-`legacy/crates/` contains an archived, older workspace split that is not maintained.
+### Cargo (crates.io)
+```bash
+cargo install raymon
+```
 
-> [!Warning]
-> Raymon binds to `127.0.0.1` by default. If you enable remote binds (`RAYMON_ALLOW_REMOTE=1`),
-> Raymon requires `RAYMON_AUTH_TOKEN` by default. Use `RAYMON_ALLOW_INSECURE_REMOTE=1` only on a trusted network.
+### Homebrew
+```bash
+brew install bnomei/raymon/raymon
+```
+
+### GitHub Releases
+Download a prebuilt archive from the GitHub Releases page, extract it, and place `raymon` on your `PATH`.
+
+### From source
+```bash
+git clone https://github.com/bnomei/raymon.git
+cd raymon
+cargo build --release
+```
 
 ## Quickstart
 
-Run Raymon:
+### Sending Logs
+
+You can send from any compatible [Ray App](https://myray.app) library such as PHP, Javascript, Bash, Ruby, Python, Go and Dart.
+If you want a Rust-native way to send Ray-compatible payloads, use my companion library [`ray-dbg`](https://github.com/bnomei/ray-dbg).
+
+### Run Raymon locally with TUI
+
+Run Raymon on the Ray default port:
 
 ```bash
 raymon
-```
-
-Run Raymon on the Ray default port (handy if your Ray client defaults to `23517`):
-
-```bash
+# or
 RAYMON_PORT=23517 raymon
 ```
 
-Headless mode (no TUI):
-
-```bash
-RAYMON_NO_TUI=1 raymon
-```
-
-Demo mode (self-generates events):
+### Demo mode (self-generates events):
 
 ```bash
 raymon --demo
 ```
 
-### MCP Client Setup (Agents)
+### TUI<-->MCPs (Streamable HTTP)
 
-Raymon supports MCP over:
-- **stdio (local)** via `raymon mcp`
-- **Streamable HTTP (remote)** via `http://<host>:<port>/mcp` (default: `http://127.0.0.1:23517/mcp`)
-
-#### Local (stdio)
-
-In stdio mode, Raymon still starts the HTTP ingest endpoint on `RAYMON_HOST`/`RAYMON_PORT`
-(default `127.0.0.1:23517`), but MCP runs over stdio for your MCP client.
-This mode runs without the TUI (stdout is reserved for MCP).
-
-Add it to your MCP client:
+1) Start **your local HTTP** with TUI listening to default port `23517`
 ```bash
-# Codex CLI
-codex mcp add raymon -- raymon mcp
+raymon
+```
 
-# Claude Code
-claude mcp add --transport stdio raymon -- raymon mcp
+2) Add the local HTTP to the **agents harness** via MCP settings:
+```bash
+codex mcp add raymon --url http://127.0.0.1:23517/mcp
 ```
 
 ```json
 {
   "mcpServers": {
     "raymon": {
-      "command": "raymon",
-      "args": ["mcp"]
+      "url": "http://127.0.0.1:23517/mcp"
     }
   }
 }
 ```
 
-#### Remote (Streamable HTTP)
+### Remote (Streamable HTTP)
 
 1) Start Raymon (recommended: require + send auth)
 ```bash
@@ -100,26 +108,19 @@ codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON
 }
 ```
 
-If you change `RAYMON_HOST` / `RAYMON_PORT`, update the MCP URL accordingly.
-
-### Sending Logs
-
-If you want a Rust-native way to send Ray-compatible payloads, use the companion library
-[`ray-dbg`](https://github.com/bnomei/ray-dbg).
-
 ## HTTP Endpoints
 
 - `POST /`: Ray ingest endpoint (Ray payload envelope).
   - If the request body looks like JSON-RPC (`{"jsonrpc":"2.0","method":...}`), Raymon will treat it as MCP.
-- `POST /mcp`: MCP Streamable HTTP endpoint (rmcp).
+- `POST /mcp`: MCP Streamable HTTP endpoint.
 
-## MCP Tools (Small On Purpose)
+## MCP Tools
 
-Raymon exposes a small tool surface (compared to the Ray desktop app’s tool list) so it stays usable for agents.
+Raymon exposes an intentionally small tool surface so it stays usable for agents.
 
 Tools and their input/output shapes:
 
-- `ray.list_entries` - list stored entries (supports `limit` + `offset`)
+- `raymon.search` - search stored entries (supports `limit` + `offset`)
 
   Parameters:
   ```json
@@ -149,106 +150,68 @@ Tools and their input/output shapes:
         "payload_types": ["string"]
       }
     ],
+    "count": "number",
     "limit": "number",
     "offset": "number"
   }
   ```
+  `count` is the total number of entries matching the filters (ignores `limit`/`offset`).
 
-- `ray.get_entry` - fetch one entry by UUID
+- `raymon.get_entries` - fetch entries by UUID(s)
 
   Parameters:
   ```json
-  { "uuid": "string" }
+  { "uuids": ["string"] }
   ```
+  Fallback (legacy/single): `{ "uuid": "string" }`
 
   Result:
   ```json
   {
-    "entry": {
-      "uuid": "string",
-      "received_at": "number",
-      "project": "string",
-      "host": "string",
-      "screen": "string",
-      "session_id": "string (or null)",
-      "payloads": [
-        {
-          "type": "string",
-          "content": "any",
-          "origin": {
-            "project": "string",
-            "host": "string",
-            "screen": "string (or null)",
-            "session_id": "string (or null)",
-            "function_name": "string (or null)",
-            "file": "string (or null)",
-            "line_number": "number (or null)"
+    "entries": [
+      {
+        "uuid": "string",
+        "received_at": "number",
+        "project": "string",
+        "host": "string",
+        "screen": "string",
+        "session_id": "string (or null)",
+        "payloads": [
+          {
+            "type": "string",
+            "content": "any",
+            "origin": {
+              "project": "string",
+              "host": "string",
+              "screen": "string (or null)",
+              "session_id": "string (or null)",
+              "function_name": "string (or null)",
+              "file": "string (or null)",
+              "line_number": "number (or null)"
+            }
           }
-        }
-      ]
-    }
+        ]
+      }
+    ]
   }
   ```
 
-- `ray.list_screens` - list screens
+## Skill
 
-  Parameters:
-  ```json
-  {}
-  ```
+This repo includes a [skill](https://agentskills.io) at `skills/raymon/SKILL.md` (an AI-facing runbook, not runtime code) that teaches an agent how to:
 
-  Result:
-  ```json
-  { "screens": ["string"] }
-  ```
-
-- `ray.emit` - emit a local action into the event stream (useful for testing)
-
-  Parameters:
-  ```json
-  { "type": "string", "data": "any (optional)" }
-  ```
-
-  Result:
-  ```json
-  { "ok": true }
-  ```
-
-- `ray.clear_screen` - clear entries for a screen (creates a new “session window” in the UI)
-
-  Parameters:
-  ```json
-  { "screen": "string" }
-  ```
-
-  Result:
-  ```json
-  { "ok": true }
-  ```
-
-- `ray.clear_all` - clear all entries
-
-  Parameters:
-  ```json
-  {}
-  ```
-
-  Result:
-  ```json
-  { "ok": true }
-  ```
-
-Shutdown signal (non-tool):
-- Custom MCP request/notification methods `raymon/quit` / `raymon/exit` (also accepts `ray/quit`, `ray/exit`) trigger a graceful shutdown.
+- generate Ray-style events using the official/community Ray libraries (PHP, JavaScript, Bash, Ruby, Rust, Python, Go, Dart),
+- connect to Raymon locally or remotely (with auth) and add it as an MCP server, and
+- use `raymon.search` → `raymon.get_entries` to triage logs and extract high-signal context (uuid, payload types, origin file/line).
 
 ## TUI
 
-The TUI is intentionally “editor-like” (vim/helix-ish):
+The TUI is intentionally “editor-like” (vim-ish):
 - `?` opens keybindings/help.
 - `q` quits (and shuts down the HTTP/MCP server).
 - `Space` opens the pickers/filters modal.
 - `/` searches (fuzzy, message + file; path-like queries are literal), `r` opens regex search (message + file).
-- `:` searches inside detail (jq).
+- `:` searches inside detail ([jq](https://jqlang.org)).
 - `J/K` or `PageUp/PageDown` scrolls the detail pane.
 - `s` snaps the color + type filters to the selected log entry.
 - `p` pauses/resumes live updates.
@@ -263,8 +226,9 @@ The TUI is intentionally “editor-like” (vim/helix-ish):
 - `o` opens the origin in your IDE (see `RAYMON_IDE`), `e` opens the detail in `$EDITOR` via a temp file.
 - In the Archives pane, `Enter` loads the selected archive; the green `‣` row returns to live (`◼` = active archive, `◻` = inactive).
 
-Color strategy: Raymon sticks to the terminal’s ANSI palette (16 colors + text attributes like bold/dim/reverse),
-so it inherits your terminal theme (light/dark, base16, etc) without implementing full app theming.
+### Theming
+
+Raymon sticks to the terminal’s ANSI palette (16 colors + text attributes like bold/dim/reverse), so it inherits your terminal theme (light/dark, base16, etc) without implementing full app theming. You can also enforce a set of colors via an `RAYMON_TUI_PALETTE` environment variable.
 
 ## Configuration
 

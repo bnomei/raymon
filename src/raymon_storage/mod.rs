@@ -1,4 +1,7 @@
 //! Storage layer for Raymon.
+//!
+//! Entries are persisted as newline-delimited JSON (`.jsonl`) on disk and indexed in-memory for
+//! fast listing and random access by id/offset.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -14,11 +17,14 @@ use tracing::info;
 mod index;
 mod jsonl;
 
+/// Default directory under the storage root where Raymon keeps persisted data.
 pub const DEFAULT_DATA_DIR: &str = "data";
+/// Default file name for the JSONL entries log inside [`DEFAULT_DATA_DIR`].
 pub const ENTRIES_FILE: &str = "entries.jsonl";
 const RETENTION_BAK_FILE: &str = "entries.jsonl.bak";
 const RETENTION_TMP_FILE: &str = "entries.jsonl.tmp";
 
+/// Errors returned by [`Storage`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("io error: {0}")]
@@ -29,6 +35,7 @@ pub enum StorageError {
     InvalidOffset { offset: u64, len: u64 },
 }
 
+/// In-memory representation of an entry that is about to be appended to storage.
 #[derive(Debug, Clone)]
 pub struct EntryInput {
     pub id: String,
@@ -43,17 +50,20 @@ pub struct EntryInput {
     pub payload: EntryPayload,
 }
 
+/// Payload variants supported by the storage layer.
 #[derive(Debug, Clone)]
 pub enum EntryPayload {
     Text(String),
 }
 
+/// Summary of entries kept/dropped after a retention pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionOutcome {
     pub dropped: usize,
     pub kept: usize,
 }
 
+/// Serialized representation of an entry as written to the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEntry {
     pub id: String,
@@ -70,12 +80,16 @@ pub struct StoredEntry {
     pub payload: StoredPayload,
 }
 
+/// Serialized payload variants as written to the JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StoredPayload {
     Text { text: String },
 }
 
+/// Index metadata for a stored entry.
+///
+/// This is designed for fast listing/filtering without loading the full JSON payload.
 #[derive(Debug, Clone)]
 pub struct OffsetMeta {
     pub id: SmolStr,
@@ -91,6 +105,7 @@ pub struct OffsetMeta {
     pub len: u64,
 }
 
+/// Lightweight filter used for listing entries from the index.
 #[derive(Debug, Default, Clone)]
 pub struct EntryFilter {
     pub id: Option<String>,
@@ -136,10 +151,17 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Create a new storage instance.
+    ///
+    /// This uses the default data directory (`data/`) and disables retention pruning.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::new_with_retention(root, 0)
     }
 
+    /// Create a new storage instance with a retention cap.
+    ///
+    /// When `retention_max_entries` is non-zero, Raymon keeps the newest `N` entries and may
+    /// rewrite the JSONL file to drop older data.
     pub fn new_with_retention(
         root: impl AsRef<Path>,
         retention_max_entries: usize,
@@ -164,6 +186,9 @@ impl Storage {
         Ok(Self { root, data_dir, entries_path, index, retention_max_entries })
     }
 
+    /// Append an entry to the JSONL file and update the in-memory index.
+    ///
+    /// Returns the indexed metadata (including byte offset and length) for the stored entry.
     pub fn append_entry(&mut self, entry: EntryInput) -> Result<OffsetMeta, StorageError> {
         let payload = match entry.payload {
             EntryPayload::Text(text) => StoredPayload::Text { text },
@@ -200,18 +225,22 @@ impl Storage {
         Ok(self.index.get_by_id(&entry_id).cloned().unwrap_or(meta))
     }
 
+    /// Storage root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Resolved data directory (`{root}/data` by default).
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
+    /// Read an entry from the JSONL file by byte offset and length.
     pub fn get_entry_by_offset(&self, offset: u64, len: u64) -> Result<StoredEntry, StorageError> {
         jsonl::read_entry_at(&self.entries_path, offset, len)
     }
 
+    /// Read an entry by id, if it exists in the index.
     pub fn get_entry_by_id(&self, id: &str) -> Result<Option<StoredEntry>, StorageError> {
         let meta = match self.index.get_by_id(id) {
             Some(meta) => meta,
@@ -220,10 +249,12 @@ impl Storage {
         self.get_entry_by_offset(meta.offset, meta.len).map(Some)
     }
 
+    /// List entry metadata from the index with an optional [`EntryFilter`].
     pub fn list_entries(&self, filter: Option<&EntryFilter>) -> Vec<OffsetMeta> {
         self.index.list(filter)
     }
 
+    /// List entry metadata using the shared core [`Filters`](crate::raymon_core::Filters).
     pub fn list_entries_core(
         &self,
         filters: &CoreFilters,
@@ -231,6 +262,7 @@ impl Storage {
         self.index.list_core(filters)
     }
 
+    /// Rebuild the in-memory index by scanning the JSONL file.
     pub fn rebuild_index(&mut self) -> Result<(), StorageError> {
         self.index = index::rebuild(&self.entries_path)?;
         Ok(())
@@ -256,7 +288,7 @@ impl Storage {
 }
 
 fn retention_slack(max_entries: usize) -> usize {
-    (max_entries / 10).max(1).min(10_000)
+    (max_entries / 10).clamp(1, 10_000)
 }
 
 fn enforce_retention(
@@ -284,7 +316,10 @@ fn enforce_retention(
     let offsets: Vec<(u64, u64)> = offsets.into_iter().collect();
     rewrite_retained_offsets(entries_path, &offsets)?;
 
-    Ok(Some(RetentionOutcome { dropped: total.saturating_sub(retention_max_entries), kept: retention_max_entries }))
+    Ok(Some(RetentionOutcome {
+        dropped: total.saturating_sub(retention_max_entries),
+        kept: retention_max_entries,
+    }))
 }
 
 fn rewrite_retained_offsets(
@@ -619,14 +654,16 @@ mod tests {
         };
         storage.append_entry(input).expect("append entry");
 
-        let mut filters = CoreFilters::default();
-        filters.query = Some("hello".to_string());
-        filters.types = vec!["log".to_string()];
-        filters.colors = vec!["blue".to_string()];
-        filters.project = Some("project-a".to_string());
-        filters.host = Some("host-1".to_string());
-        filters.screen = Some(core_entry.screen.clone());
-        filters.limit = Some(1);
+        let filters = CoreFilters {
+            query: Some("hello".to_string()),
+            types: vec!["log".to_string()],
+            colors: vec!["blue".to_string()],
+            screen: Some(core_entry.screen.clone()),
+            project: Some("project-a".to_string()),
+            host: Some("host-1".to_string()),
+            limit: Some(1),
+            ..Default::default()
+        };
 
         let listed = storage.list_entries_core(&filters).expect("list core entries");
         assert_eq!(listed.len(), 1);
@@ -638,9 +675,11 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let storage = Storage::new(dir.path()).expect("storage");
 
-        let mut filters = CoreFilters::default();
-        filters.query = Some("[invalid".to_string());
-        filters.query_is_regex = true;
+        let filters = CoreFilters {
+            query: Some("[invalid".to_string()),
+            query_is_regex: true,
+            ..Default::default()
+        };
 
         let result = storage.list_entries_core(&filters);
         assert!(result.is_err());
@@ -665,9 +704,11 @@ mod tests {
         };
         storage.append_entry(input).expect("append entry");
 
-        let mut filters = CoreFilters::default();
-        filters.query = Some("hello".to_string());
-        filters.query_is_regex = true;
+        let filters = CoreFilters {
+            query: Some("hello".to_string()),
+            query_is_regex: true,
+            ..Default::default()
+        };
 
         let listed = storage.list_entries_core(&filters).expect("list core entries");
         assert_eq!(listed.len(), 1);
@@ -693,8 +734,7 @@ mod tests {
         };
         storage.append_entry(input).expect("append entry");
 
-        let mut filters = CoreFilters::default();
-        filters.types = vec!["log".to_string()];
+        let filters = CoreFilters { types: vec!["log".to_string()], ..Default::default() };
 
         let listed = storage.list_entries_core(&filters).expect("list core entries");
         assert!(listed.is_empty());

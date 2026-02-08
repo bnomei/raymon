@@ -36,14 +36,13 @@ use axum::{
     routing::post,
     Router,
 };
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
-use rmcp::ServiceExt as McpServiceExt;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
@@ -67,6 +66,7 @@ const DEFAULT_STORAGE_MAX_ENTRIES: usize = 100_000;
 const DEFAULT_MAX_CONCURRENCY: usize = 64;
 const DEFAULT_JQ_TIMEOUT_MS: u64 = 10_000;
 
+/// Convenience error type used by the public [`run`] entrypoint.
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug)]
@@ -82,8 +82,6 @@ enum UiEvent {
 #[derive(Parser, Debug)]
 #[command(name = "raymon", version, about = "Raymon CLI")]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<CliCommand>,
     #[arg(long, global = true)]
     host: Option<String>,
     #[arg(long, global = true)]
@@ -102,12 +100,6 @@ struct Cli {
     no_tui: bool,
     #[arg(long, action = clap::ArgAction::SetTrue, global = true)]
     demo: bool,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-enum CliCommand {
-    /// Run as an MCP server over stdio (no TUI)
-    Mcp,
 }
 
 #[derive(Debug, Clone)]
@@ -211,9 +203,7 @@ impl Config {
             max_body_bytes: partial.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
             max_query_len: partial.max_query_len.unwrap_or(DEFAULT_MAX_QUERY_LEN),
             max_entries: partial.max_entries.unwrap_or(DEFAULT_MAX_ENTRIES),
-            storage_max_entries: partial
-                .storage_max_entries
-                .unwrap_or(DEFAULT_STORAGE_MAX_ENTRIES),
+            storage_max_entries: partial.storage_max_entries.unwrap_or(DEFAULT_STORAGE_MAX_ENTRIES),
             jq_timeout_ms: partial.jq_timeout_ms.unwrap_or(DEFAULT_JQ_TIMEOUT_MS),
             allow_remote: partial.allow_remote.unwrap_or(false),
             allow_insecure_remote: partial.allow_insecure_remote.unwrap_or(false),
@@ -449,6 +439,17 @@ impl CoreStateStoreTrait for CoreState {
 
     fn list_entries(&self, filters: &Filters) -> Result<Vec<CoreEntry>, Self::Error> {
         self.list(filters)
+    }
+
+    fn list_entries_with_count(
+        &self,
+        filters: &Filters,
+    ) -> Result<(Vec<CoreEntry>, usize), Self::Error> {
+        let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
+        let (matches, count) = filters
+            .apply_with_count(inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)))
+            .map_err(|error| StateError::Filter(error.to_string()))?;
+        Ok((matches.into_iter().cloned().collect(), count))
     }
 
     fn list_screens(&self) -> Result<Vec<Screen>, Self::Error> {
@@ -711,10 +712,7 @@ fn build_search_text(entry: &CoreEntry) -> SearchTextMetadata {
 
     const MESSAGE_TOKEN_LIMIT: usize = 1024;
 
-    let mut cap = entry.project.len()
-        + entry.host.len()
-        + entry.screen.as_str().len()
-        + 4;
+    let mut cap = entry.project.len() + entry.host.len() + entry.screen.as_str().len() + 4;
     if let Some(session) = &entry.session_id {
         cap += session.as_str().len() + 1;
     }
@@ -1276,64 +1274,6 @@ fn storage_root(cwd: &Path, config_path: Option<&PathBuf>) -> PathBuf {
     config_path.and_then(|path| path.parent()).unwrap_or(cwd).to_path_buf()
 }
 
-async fn run_mcp_stdio(
-    core: CoreState,
-    bus: CoreBus,
-    mut shutdown: broadcast::Receiver<()>,
-    shutdown_tx: broadcast::Sender<()>,
-    max_query_len: usize,
-) -> Result<(), DynError> {
-    let handler =
-        RaymonMcp::new_with_shutdown_and_limits(core, bus, shutdown_tx.clone(), max_query_len);
-    handler.start_event_forwarder().map_err(|error| -> DynError { error.to_string().into() })?;
-
-    let service = tokio::select! {
-        _ = shutdown.recv() => {
-            return Ok(());
-        }
-        service = handler.serve(rmcp::transport::stdio()) => {
-            service?
-        }
-    };
-    let mut service_ct = Some(service.cancellation_token());
-
-    let mut waiting_handle = tokio::spawn(async move { service.waiting().await });
-
-    tokio::select! {
-        _ = shutdown.recv() => {
-            if let Some(ct) = service_ct.take() {
-                ct.cancel();
-            }
-        }
-        result = &mut waiting_handle => {
-            let _ = shutdown_tx.send(());
-            mcp_wait_result(result)?;
-            return Ok(());
-        }
-    }
-
-    let result = waiting_handle.await;
-    mcp_wait_result(result)?;
-    Ok(())
-}
-
-fn mcp_wait_result(
-    result: Result<
-        Result<rmcp::service::QuitReason, tokio::task::JoinError>,
-        tokio::task::JoinError,
-    >,
-) -> Result<rmcp::service::QuitReason, DynError> {
-    let reason = match result {
-        Ok(Ok(reason)) => reason,
-        Ok(Err(error)) | Err(error) => return Err(Box::new(error)),
-    };
-
-    match reason {
-        rmcp::service::QuitReason::Cancelled | rmcp::service::QuitReason::Closed => Ok(reason),
-        rmcp::service::QuitReason::JoinError(error) => Err(Box::new(error)),
-    }
-}
-
 async fn run_server(
     config: Config,
     state: AppState,
@@ -1388,7 +1328,7 @@ async fn run_tui(
     shutdown_tx: broadcast::Sender<()>,
     pause_tx: Option<watch::Sender<bool>>,
 ) -> Result<(), DynError> {
-    let mut event_rx =
+    let event_rx =
         bus.subscribe().map_err(|error| format!("event bus subscribe failed: {error}"))?;
     let (log_tx, log_rx) = std::sync::mpsc::channel::<UiEvent>();
     let log_tx_forward = log_tx.clone();
@@ -1403,12 +1343,8 @@ async fn run_tui(
     }
 
     let started_at = crate::raymon_ingest::now_millis();
-    let forward_handle = tokio::spawn(forward_events_to_ui(
-        event_rx,
-        log_tx_forward,
-        core,
-        started_at,
-    ));
+    let forward_handle =
+        tokio::spawn(forward_events_to_ui(event_rx, log_tx_forward, core, started_at));
 
     let shutdown_handle = tokio::spawn(async move {
         let _ = shutdown.recv().await;
@@ -1581,7 +1517,8 @@ async fn forward_events_to_ui(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                dropped_total = dropped_total.saturating_add((skipped.min(usize::MAX as u64)) as usize);
+                dropped_total =
+                    dropped_total.saturating_add((skipped.min(usize::MAX as u64)) as usize);
 
                 let entries = match core.list(&Filters::default()) {
                     Ok(entries) => entries,
@@ -1678,8 +1615,9 @@ fn build_router(
     )?;
     let router_state = RouterState { app: state, mcp: mcp_service.clone() };
     let auth_state = AuthState { token: auth_token };
-    let concurrency_state =
-        ConcurrencyState { semaphore: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENCY)) };
+    let concurrency_state = ConcurrencyState {
+        semaphore: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENCY)),
+    };
     let router = Router::new()
         .route("/", post(ingest_or_mcp_handler))
         .route_service("/mcp", mcp_service)
@@ -1746,8 +1684,10 @@ async fn auth_middleware(
 async fn ingest_or_mcp_handler(State(state): State<RouterState>, body: Bytes) -> impl IntoResponse {
     let ingestor = state.app.ingestor();
     let body_for_ingest = body.clone();
-    let response = match tokio::task::spawn_blocking(move || ingestor.handle(body_for_ingest.as_ref()))
-        .await
+    let response = match tokio::task::spawn_blocking(move || {
+        ingestor.handle(body_for_ingest.as_ref())
+    })
+    .await
     {
         Ok(response) => response,
         Err(error) => crate::raymon_ingest::IngestResponse {
@@ -2150,19 +2090,17 @@ async fn run_demo(
     }
 }
 
+/// Entry point for the `raymon` CLI.
+///
+/// Resolves configuration from CLI args, environment variables and an optional `ray.json`, then
+/// starts the HTTP ingest/MCP server and (unless disabled) the terminal UI.
 pub async fn run() -> Result<(), DynError> {
-    // Important: MCP stdio uses stdout for the protocol, so always log to stderr.
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
     let env_map: BTreeMap<String, String> = env::vars().collect();
-    let (mut config, config_path) = resolve_config(&cli, &cwd, &env_map)?;
-    let mcp_stdio = matches!(cli.command, Some(CliCommand::Mcp));
-    if mcp_stdio {
-        // MCP stdio uses stdout for the protocol, so we can't run the TUI.
-        config.tui_enabled = false;
-    }
+    let (config, config_path) = resolve_config(&cli, &cwd, &env_map)?;
 
     if let Some(path) = &config_path {
         info!(path = %path.display(), "loaded config file");
@@ -2172,7 +2110,7 @@ pub async fn run() -> Result<(), DynError> {
 
     info!(
         enabled = config.enabled,
-        mode = if mcp_stdio { "mcp-stdio" } else { "default" },
+        mode = "default",
         host = %config.host,
         port = config.port,
         tui_enabled = config.tui_enabled,
@@ -2225,54 +2163,6 @@ pub async fn run() -> Result<(), DynError> {
         shutdown_tx.subscribe(),
         shutdown_tx.clone(),
     ));
-
-    if mcp_stdio {
-        let mut mcp_handle = tokio::spawn(run_mcp_stdio(
-            state.core.clone(),
-            state.bus.clone(),
-            shutdown_tx.subscribe(),
-            shutdown_tx.clone(),
-            config.max_query_len,
-        ));
-
-        let mut server_result: Option<Result<(), DynError>> = None;
-        let mut mcp_result: Option<Result<(), DynError>> = None;
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                let _ = shutdown_tx.send(());
-            }
-            _ = shutdown_rx.recv() => {}
-            res = &mut server_handle => {
-                server_result = Some(res?);
-                let _ = shutdown_tx.send(());
-            }
-            res = &mut mcp_handle => {
-                mcp_result = Some(res?);
-                let _ = shutdown_tx.send(());
-            }
-        }
-
-        // Ensure every component sees the shutdown signal (idempotent).
-        let _ = shutdown_tx.send(());
-
-        let mcp_result = match mcp_result {
-            Some(result) => result,
-            None => mcp_handle.await?,
-        };
-        let server_result = match server_result {
-            Some(result) => result,
-            None => server_handle.await?,
-        };
-
-        if let Some(handle) = demo_handle {
-            let _ = handle.await;
-        }
-
-        mcp_result?;
-        server_result?;
-        return Ok(());
-    }
 
     let tui_handle = if config.tui_enabled {
         let palette = tui_palette_override(&env_map)?;
@@ -2389,7 +2279,6 @@ mod tests {
             "--no-tui",
         ]);
 
-        assert!(cli.command.is_none());
         assert_eq!(cli.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(cli.port, Some(9999));
         assert_eq!(cli.config.as_deref(), Some(Path::new("config.json")));
@@ -2399,15 +2288,6 @@ mod tests {
         assert!(!cli.tui);
         assert!(cli.no_tui);
         assert!(!cli.demo);
-    }
-
-    #[test]
-    fn cli_parses_mcp_subcommand() {
-        let cli = Cli::parse_from(["raymon", "mcp", "--host", "127.0.0.1", "--demo"]);
-
-        assert!(matches!(cli.command, Some(CliCommand::Mcp)));
-        assert_eq!(cli.host.as_deref(), Some("127.0.0.1"));
-        assert!(cli.demo);
     }
 
     #[test]
@@ -2435,7 +2315,6 @@ mod tests {
         env_map.insert("RAYMON_NO_TUI".to_string(), "1".to_string());
 
         let cli = Cli {
-            command: None,
             host: Some("0.0.0.0".to_string()),
             port: None,
             config: None,
@@ -2675,12 +2554,8 @@ mod tests {
         };
         core.update(updated).expect("update");
 
-        let uuids: Vec<String> = core
-            .list(&filters)
-            .expect("list")
-            .into_iter()
-            .map(|entry| entry.uuid)
-            .collect();
+        let uuids: Vec<String> =
+            core.list(&filters).expect("list").into_iter().map(|entry| entry.uuid).collect();
         assert_eq!(uuids, vec!["entry-1", "entry-2", "entry-3"]);
 
         let entry = core.get("entry-2").expect("get").expect("entry-2");
@@ -2726,12 +2601,8 @@ mod tests {
 
         assert!(core.get("entry-1").expect("get").is_none());
 
-        let uuids: Vec<String> = core
-            .list(&filters)
-            .expect("list")
-            .into_iter()
-            .map(|entry| entry.uuid)
-            .collect();
+        let uuids: Vec<String> =
+            core.list(&filters).expect("list").into_iter().map(|entry| entry.uuid).collect();
         assert_eq!(uuids, vec!["entry-2", "entry-3"]);
     }
 

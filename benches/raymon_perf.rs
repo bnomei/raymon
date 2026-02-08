@@ -1,10 +1,4 @@
-#[path = "../src/colors.rs"]
-mod colors;
-
-#[path = "../src/raymon_core.rs"]
-mod raymon_core;
-
-use raymon_core::{Entry, Filters, Origin, Payload, Screen};
+use raymon::raymon_core::{Entry, Filters, Origin, Payload, Screen};
 use serde_json::{json, Map, Value};
 
 fn main() {
@@ -176,8 +170,7 @@ fn make_object_with_strings(count: usize) -> Value {
 #[divan::bench(args = [256usize, 2048usize, 8192usize])]
 fn filters_substring_string_miss(bencher: divan::Bencher, len: usize) {
     let entries = make_entries(len, Value::String("Hello there".to_string()));
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply(entries.iter()).expect("filters apply");
@@ -188,8 +181,7 @@ fn filters_substring_string_miss(bencher: divan::Bencher, len: usize) {
 #[divan::bench(args = [256usize, 2048usize, 8192usize])]
 fn filters_substring_string_miss_parallel(bencher: divan::Bencher, len: usize) {
     let entries = make_entries(len, Value::String("Hello there".to_string()));
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
@@ -200,8 +192,7 @@ fn filters_substring_string_miss_parallel(bencher: divan::Bencher, len: usize) {
 #[divan::bench(args = [2048usize, 8192usize])]
 fn filters_substring_string_miss_realistic(bencher: divan::Bencher, len: usize) {
     let entries = make_entries_realistic_string(len);
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply(entries.iter()).expect("filters apply");
@@ -212,8 +203,7 @@ fn filters_substring_string_miss_realistic(bencher: divan::Bencher, len: usize) 
 #[divan::bench(args = [2048usize, 8192usize])]
 fn filters_substring_string_miss_realistic_parallel(bencher: divan::Bencher, len: usize) {
     let entries = make_entries_realistic_string(len);
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
@@ -230,8 +220,7 @@ fn filters_substring_object_miss(bencher: divan::Bencher, len: usize) {
         "extra": "field"
     });
     let entries = make_entries(len, content);
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply(entries.iter()).expect("filters apply");
@@ -248,8 +237,7 @@ fn filters_substring_object_miss_parallel(bencher: divan::Bencher, len: usize) {
         "extra": "field"
     });
     let entries = make_entries(len, content);
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
@@ -260,8 +248,7 @@ fn filters_substring_object_miss_parallel(bencher: divan::Bencher, len: usize) {
 #[divan::bench(args = [2048usize, 8192usize])]
 fn filters_substring_object_miss_many_string_fields(bencher: divan::Bencher, len: usize) {
     let entries = make_entries(len, make_object_with_strings(30));
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply(entries.iter()).expect("filters apply");
@@ -272,8 +259,7 @@ fn filters_substring_object_miss_many_string_fields(bencher: divan::Bencher, len
 #[divan::bench(args = [2048usize, 8192usize])]
 fn filters_substring_object_miss_many_string_fields_parallel(bencher: divan::Bencher, len: usize) {
     let entries = make_entries(len, make_object_with_strings(30));
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
@@ -284,8 +270,7 @@ fn filters_substring_object_miss_many_string_fields_parallel(bencher: divan::Ben
 #[divan::bench(args = [2048usize, 8192usize])]
 fn filters_substring_object_miss_realistic(bencher: divan::Bencher, len: usize) {
     let entries = make_entries_realistic_object(len);
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply(entries.iter()).expect("filters apply");
@@ -296,8 +281,7 @@ fn filters_substring_object_miss_realistic(bencher: divan::Bencher, len: usize) 
 #[divan::bench(args = [2048usize, 8192usize])]
 fn filters_substring_object_miss_realistic_parallel(bencher: divan::Bencher, len: usize) {
     let entries = make_entries_realistic_object(len);
-    let mut filters = Filters::default();
-    filters.query = Some("does-not-exist".to_string());
+    let filters = Filters { query: Some("does-not-exist".to_string()), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");
@@ -314,9 +298,8 @@ fn filters_substring_object_hit_limit_1(bencher: divan::Bencher, len: usize) {
         "extra": "field"
     });
     let entries = make_entries(len, content);
-    let mut filters = Filters::default();
-    filters.query = Some("hello".to_string());
-    filters.limit = Some(1);
+    let filters =
+        Filters { query: Some("hello".to_string()), limit: Some(1), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply(entries.iter()).expect("filters apply");
@@ -333,9 +316,8 @@ fn filters_substring_object_hit_limit_1_parallel(bencher: divan::Bencher, len: u
         "extra": "field"
     });
     let entries = make_entries(len, content);
-    let mut filters = Filters::default();
-    filters.query = Some("hello".to_string());
-    filters.limit = Some(1);
+    let filters =
+        Filters { query: Some("hello".to_string()), limit: Some(1), ..Default::default() };
 
     bencher.counter(len).bench(|| {
         let matched = filters.apply_parallel(&entries).expect("filters apply_parallel");

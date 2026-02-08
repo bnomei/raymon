@@ -65,6 +65,7 @@ fn enforce_peer_cap<P>(peers: &mut Vec<P>, cap: usize) {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors that can occur while initializing the MCP server.
 pub enum McpInitError {
     #[error("event bus subscription failed: {0}")]
     EventBus(String),
@@ -97,6 +98,10 @@ impl EventStream for mpsc::Receiver<Event> {
     }
 }
 
+/// Raymon MCP server handler.
+///
+/// This type wires together a [`StateStore`] and [`EventBus`] to expose Raymon tools over MCP and
+/// forwards internal [`Event`]s as MCP notifications to connected peers.
 #[derive(Clone)]
 pub struct RaymonMcp<S, B> {
     state: S,
@@ -116,6 +121,7 @@ where
     B::Error: Display + Send + Sync + 'static,
     B::Subscription: EventStream + Send + 'static,
 {
+    /// Create a handler with default limits and without a shutdown channel.
     pub fn new(state: S, bus: B) -> Self {
         Self {
             state,
@@ -128,6 +134,7 @@ where
         }
     }
 
+    /// Create a handler that will also listen to a shutdown broadcast channel.
     pub fn new_with_shutdown(state: S, bus: B, shutdown: broadcast::Sender<()>) -> Self {
         Self {
             state,
@@ -140,6 +147,7 @@ where
         }
     }
 
+    /// Create a handler with a shutdown channel and an explicit maximum query length.
     pub fn new_with_shutdown_and_limits(
         state: S,
         bus: B,
@@ -231,14 +239,15 @@ where
     }
 
     fn map_filters(params: &ListEntriesParams) -> Filters {
-        let mut filters = Filters::default();
-        filters.query = params.query.clone();
-        filters.types = params.types.clone();
-        filters.colors = params.colors.clone();
-        filters.screen = params.screen.as_ref().map(|value| Screen::new(value.clone()));
-        filters.project = params.project.clone();
-        filters.host = params.host.clone();
-        filters
+        Filters {
+            query: params.query.clone(),
+            types: params.types.clone(),
+            colors: params.colors.clone(),
+            screen: params.screen.as_ref().map(|value| Screen::new(value.clone())),
+            project: params.project.clone(),
+            host: params.host.clone(),
+            ..Default::default()
+        }
     }
 
     fn state_error(error: S::Error) -> McpError {
@@ -255,14 +264,6 @@ where
             }
         }
         McpError::internal_error(format!("state store error: {error}"), None)
-    }
-
-    fn bus_error(error: B::Error) -> McpError {
-        McpError::internal_error(format!("event bus error: {error}"), None)
-    }
-
-    async fn emit_notification(&self, notification: ServerNotification) {
-        broadcast_notification(&self.peers, notification).await;
     }
 
     fn maybe_quit(&self, method: &str) {
@@ -284,8 +285,8 @@ where
     B::Error: Display + Send + Sync + 'static,
     B::Subscription: EventStream + Send + 'static,
 {
-    #[tool(name = "ray.list_entries", description = "List entries using Raymon filters")]
-    async fn list_entries(
+    #[tool(name = "raymon.search", description = "Search entries using Raymon filters")]
+    async fn search(
         &self,
         Parameters(params): Parameters<ListEntriesParams>,
     ) -> Result<Json<ListEntriesResult>, McpError> {
@@ -301,65 +302,34 @@ where
         let mut filters = Self::map_filters(&params);
         filters.limit = Some(limit);
         filters.offset = offset;
-        let entries = self.state.list_entries(&filters).map_err(Self::state_error)?;
+        let (entries, count) =
+            self.state.list_entries_with_count(&filters).map_err(Self::state_error)?;
         let summaries = entries.into_iter().map(EntrySummary::from).collect::<Vec<_>>();
-        Ok(Json(ListEntriesResult { entries: summaries, limit, offset }))
+        Ok(Json(ListEntriesResult { entries: summaries, count, limit, offset }))
     }
 
-    #[tool(name = "ray.get_entry", description = "Fetch a single entry by UUID")]
-    async fn get_entry(
+    #[tool(name = "raymon.get_entries", description = "Fetch entries by UUID")]
+    async fn get_entries(
         &self,
-        Parameters(params): Parameters<GetEntryParams>,
-    ) -> Result<Json<GetEntryResult>, McpError> {
-        let entry = self.state.get_entry(&params.uuid).map_err(Self::state_error)?;
-        let entry = entry.map(McpEntry::from);
-        Ok(Json(GetEntryResult { entry }))
-    }
-
-    #[tool(name = "ray.list_screens", description = "List screens available in state")]
-    async fn list_screens(&self) -> Result<Json<ListScreensResult>, McpError> {
-        let screens = self.state.list_screens().map_err(Self::state_error)?;
-        Ok(Json(ListScreensResult {
-            screens: screens.into_iter().map(|screen| screen.as_str().to_string()).collect(),
-        }))
-    }
-
-    #[tool(name = "ray.emit", description = "Emit a local action into the MCP event stream")]
-    async fn emit(
-        &self,
-        Parameters(params): Parameters<EmitParams>,
-    ) -> Result<Json<EmitResult>, McpError> {
-        if let Some(event) = map_emit_to_core_event(&params)? {
-            self.bus.emit(event).map_err(Self::bus_error)?;
+        Parameters(params): Parameters<GetEntriesParams>,
+    ) -> Result<Json<GetEntriesResult>, McpError> {
+        let uuids = params.uuids.into_vec();
+        if uuids.is_empty() {
+            return Err(McpError::invalid_params("uuids must not be empty".to_string(), None));
         }
 
-        let notification = ServerNotification::CustomNotification(CustomNotification::new(
-            "ray/emit",
-            Some(json!({ "type": params.event_type, "data": params.data })),
-        ));
-        self.emit_notification(notification).await;
+        let mut entries = Vec::new();
+        for uuid in uuids {
+            if uuid.is_empty() {
+                return Err(McpError::invalid_params("uuid must not be empty".to_string(), None));
+            }
+            let entry = self.state.get_entry(&uuid).map_err(Self::state_error)?;
+            if let Some(entry) = entry {
+                entries.push(McpEntry::from(entry));
+            }
+        }
 
-        Ok(Json(EmitResult { ok: true }))
-    }
-
-    #[tool(name = "ray.clear_screen", description = "Clear entries for a screen")]
-    async fn clear_screen(
-        &self,
-        Parameters(params): Parameters<ClearScreenParams>,
-    ) -> Result<Json<ClearResult>, McpError> {
-        let screen = Screen::new(params.screen);
-        let mut state = self.state.clone();
-        state.clear_screen(&screen).map_err(Self::state_error)?;
-        self.bus.emit(Event::ScreenCleared(screen)).map_err(Self::bus_error)?;
-        Ok(Json(ClearResult { ok: true }))
-    }
-
-    #[tool(name = "ray.clear_all", description = "Clear all entries")]
-    async fn clear_all(&self) -> Result<Json<ClearResult>, McpError> {
-        let mut state = self.state.clone();
-        state.clear_all().map_err(Self::state_error)?;
-        self.bus.emit(Event::StateCleared).map_err(Self::bus_error)?;
-        Ok(Json(ClearResult { ok: true }))
+        Ok(Json(GetEntriesResult { entries }))
     }
 }
 
@@ -429,49 +399,39 @@ pub struct ListEntriesParams {
     offset: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct GetEntryParams {
-    uuid: String,
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum UuidSelector {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl UuidSelector {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(uuid) => vec![uuid],
+            Self::Many(uuids) => uuids,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct EmitParams {
-    #[serde(rename = "type", alias = "event", alias = "name")]
-    event_type: String,
-    #[serde(default)]
-    data: Option<Value>,
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct ClearScreenParams {
-    screen: String,
+pub struct GetEntriesParams {
+    #[serde(alias = "uuid")]
+    uuids: UuidSelector,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ListEntriesResult {
     entries: Vec<EntrySummary>,
+    count: usize,
     limit: usize,
     offset: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
-pub struct GetEntryResult {
-    entry: Option<McpEntry>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct ListScreensResult {
-    screens: Vec<String>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct EmitResult {
-    ok: bool,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct ClearResult {
-    ok: bool,
+pub struct GetEntriesResult {
+    entries: Vec<McpEntry>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -572,46 +532,6 @@ impl From<crate::raymon_core::Origin> for McpOrigin {
     }
 }
 
-fn map_emit_to_core_event(params: &EmitParams) -> Result<Option<Event>, McpError> {
-    match params.event_type.as_str() {
-        "entry_inserted" => {
-            let data = params.data.clone().ok_or_else(|| {
-                McpError::invalid_params("missing entry_inserted data".to_string(), None)
-            })?;
-            let entry = serde_json::from_value(data).map_err(|err| {
-                McpError::invalid_params(format!("invalid entry_inserted data: {err}"), None)
-            })?;
-            Ok(Some(Event::EntryInserted(entry)))
-        }
-        "entry_updated" => {
-            let data = params.data.clone().ok_or_else(|| {
-                McpError::invalid_params("missing entry_updated data".to_string(), None)
-            })?;
-            let entry = serde_json::from_value(data).map_err(|err| {
-                McpError::invalid_params(format!("invalid entry_updated data: {err}"), None)
-            })?;
-            Ok(Some(Event::EntryUpdated(entry)))
-        }
-        "screen_cleared" => {
-            let data = params.data.clone().ok_or_else(|| {
-                McpError::invalid_params("missing screen_cleared data".to_string(), None)
-            })?;
-            let screen = match data {
-                Value::String(value) => Screen::new(value),
-                other => {
-                    return Err(McpError::invalid_params(
-                        format!("invalid screen_cleared data: {other}"),
-                        None,
-                    ))
-                }
-            };
-            Ok(Some(Event::ScreenCleared(screen)))
-        }
-        "state_cleared" => Ok(Some(Event::StateCleared)),
-        _ => Ok(None),
-    }
-}
-
 fn normalize_pagination(limit: Option<usize>, offset: Option<usize>) -> (usize, usize) {
     let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
     let offset = offset.unwrap_or(0);
@@ -680,11 +600,8 @@ mod tests {
 
     #[test]
     fn prune_closed_peers_removes_closed_entries() {
-        let mut peers = vec![
-            MockPeer { closed: false },
-            MockPeer { closed: true },
-            MockPeer { closed: false },
-        ];
+        let mut peers =
+            vec![MockPeer { closed: false }, MockPeer { closed: true }, MockPeer { closed: false }];
 
         prune_closed_peers(&mut peers);
 
@@ -797,13 +714,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_entries_maps_filters() {
+    async fn search_maps_filters() {
         let store = TestStore {
             entries: vec![sample_entry("one")],
             screens: vec![Screen::new("main")],
             last_filters: Arc::new(Mutex::new(None)),
         };
         let bus = TestBus::new();
+        let bus_handle = bus.clone();
         let handler = RaymonMcp::new(store.clone(), bus);
 
         let params = ListEntriesParams {
@@ -814,38 +732,20 @@ mod tests {
             ..Default::default()
         };
 
-        handler.list_entries(Parameters(params)).await.expect("list_entries should succeed");
+        handler.search(Parameters(params)).await.expect("search should succeed");
 
         let filters = store.last_filters.lock().unwrap().clone().expect("filters captured");
         assert_eq!(filters.query, Some("alpha".to_string()));
         assert_eq!(filters.screen, Some(Screen::new("main")));
         assert_eq!(filters.limit, Some(10));
         assert_eq!(filters.offset, 2);
+        assert!(bus_handle.emitted().is_empty());
     }
 
     #[tokio::test]
-    async fn emit_maps_core_event_when_known() {
-        let store = TestStore {
-            entries: vec![sample_entry("one")],
-            screens: Vec::new(),
-            last_filters: Arc::new(Mutex::new(None)),
-        };
-        let bus = TestBus::new();
-        let handler = RaymonMcp::new(store, bus.clone());
-
-        let entry = sample_entry("emit");
-        let params = EmitParams {
-            event_type: "entry_inserted".to_string(),
-            data: Some(serde_json::to_value(&entry).unwrap()),
-        };
-
-        handler.emit(Parameters(params)).await.unwrap();
-        assert_eq!(bus.emitted().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn list_entries_enforces_default_limit_and_summary() {
-        let entries = (0..120)
+    async fn search_enforces_default_limit_and_summary() {
+        let total_entries = 120usize;
+        let entries = (0..total_entries)
             .map(|idx| {
                 let uuid = format!("entry-{idx}");
                 let origin = Origin {
@@ -888,7 +788,8 @@ mod tests {
         let handler = RaymonMcp::new(store, bus);
 
         let params = ListEntriesParams::default();
-        let result = handler.list_entries(Parameters(params)).await.unwrap();
+        let result = handler.search(Parameters(params)).await.unwrap();
+        assert_eq!(result.0.count, total_entries);
         assert_eq!(result.0.entries.len(), DEFAULT_LIST_LIMIT);
         let first = result.0.entries.first().expect("first entry");
         assert!(first.payload_count > 0);
@@ -940,7 +841,7 @@ mod tests {
         let handler = RaymonMcp::new(store, bus);
 
         let params = ListEntriesParams { query: Some("(/".to_string()), ..Default::default() };
-        let result = handler.list_entries(Parameters(params)).await;
+        let result = handler.search(Parameters(params)).await;
 
         let error = match result {
             Ok(_) => panic!("expected invalid params error"),
@@ -952,13 +853,8 @@ mod tests {
     #[test]
     fn schemas_are_generated_for_tools() {
         let _ = schema_for_type::<ListEntriesParams>();
-        let _ = schema_for_type::<GetEntryParams>();
-        let _ = schema_for_type::<EmitParams>();
-        let _ = schema_for_type::<ClearScreenParams>();
+        let _ = schema_for_type::<GetEntriesParams>();
         let _ = schema_for_type::<ListEntriesResult>();
-        let _ = schema_for_type::<GetEntryResult>();
-        let _ = schema_for_type::<ListScreensResult>();
-        let _ = schema_for_type::<EmitResult>();
-        let _ = schema_for_type::<ClearResult>();
+        let _ = schema_for_type::<GetEntriesResult>();
     }
 }

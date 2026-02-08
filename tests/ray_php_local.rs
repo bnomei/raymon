@@ -92,7 +92,11 @@ fn read_stored_entries(path: &Path) -> io::Result<Vec<StoredEntry>> {
     Ok(entries)
 }
 
-fn wait_for_marker_entry(path: &Path, marker: &str, timeout: Duration) -> io::Result<Option<StoredEntry>> {
+fn wait_for_marker_entry(
+    path: &Path,
+    marker: &str,
+    timeout: Duration,
+) -> io::Result<Option<StoredEntry>> {
     let deadline = Instant::now() + timeout;
     loop {
         let entries = read_stored_entries(path)?;
@@ -121,19 +125,20 @@ fn ray_php_local_integration() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let host = std::env::var("RAYMON_IT_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port = match std::env::var("RAYMON_IT_PORT").ok().and_then(|value| value.parse::<u16>().ok()) {
-        Some(port) => port,
-        None => {
-            let listener = TcpListener::bind((host.as_str(), 0))
-                .map_err(|err| format!("cannot bind {host}:0 to pick a free port: {err}"))?;
-            let port = listener
-                .local_addr()
-                .map_err(|err| format!("cannot read selected port for {host}: {err}"))?
-                .port();
-            drop(listener);
-            port
-        }
-    };
+    let port =
+        match std::env::var("RAYMON_IT_PORT").ok().and_then(|value| value.parse::<u16>().ok()) {
+            Some(port) => port,
+            None => {
+                let listener = TcpListener::bind((host.as_str(), 0))
+                    .map_err(|err| format!("cannot bind {host}:0 to pick a free port: {err}"))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|err| format!("cannot read selected port for {host}: {err}"))?
+                    .port();
+                drop(listener);
+                port
+            }
+        };
 
     let storage_root = tempfile::tempdir()?;
     let stderr_path = storage_root.path().join("raymon-stderr.log");
@@ -224,6 +229,11 @@ fn ray_php_local_integration() -> Result<(), Box<dyn std::error::Error>> {
                 stderr_path.display(),
             )
         })?;
+
+        assert!(!stored.id.is_empty(), "case `{case}`: expected stored entry id to be set");
+        if let StoredPayload::Blob { path, size } = &stored.payload {
+            assert!(!path.is_empty(), "case `{case}`: expected blob path to be set (size={size})");
+        }
 
         match case {
             "log" => assert!(

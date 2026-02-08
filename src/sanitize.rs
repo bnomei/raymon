@@ -1,9 +1,19 @@
+//! Sanitization helpers for inbound payload content.
+//!
+//! Ray clients sometimes send very large blobs (e.g. base64 data URLs) or HTML fragments from debug
+//! tools (like Symfony VarDumper). These helpers normalize and redact such content so the TUI and
+//! storage remain responsive.
+
 use crate::raymon_core::Entry;
 use serde_json::Value;
 
 const BLOB_STRING_LEN_THRESHOLD: usize = 16 * 1024;
 const BLOB_STRING_PLACEHOLDER: &str = "[[raymon:blob redacted]]";
 
+/// Sanitize all payload contents in-place.
+///
+/// - Strips Symfony VarDumper HTML into plain text (best-effort).
+/// - Redacts large base64/data-url blobs.
 pub fn sanitize_entry(entry: &mut Entry) {
     for payload in &mut entry.payloads {
         sanitize_value(&mut payload.content);
@@ -209,7 +219,11 @@ mod tests {
             host: "host".to_string(),
             screen: Screen::new("proj:host:default"),
             session_id: None,
-            payloads: vec![Payload { r#type: "log".to_string(), content: json!({ "values": [value] }), origin: origin() }],
+            payloads: vec![Payload {
+                r#type: "log".to_string(),
+                content: json!({ "values": [value] }),
+                origin: origin(),
+            }],
         }
     }
 
@@ -278,10 +292,8 @@ mod tests {
 
     #[test]
     fn redacts_data_uri_base64_strings() {
-        let blob = format!(
-            "data:image/png;base64,{}",
-            "A".repeat(super::BLOB_STRING_LEN_THRESHOLD + 8)
-        );
+        let blob =
+            format!("data:image/png;base64,{}", "A".repeat(super::BLOB_STRING_LEN_THRESHOLD + 8));
         let mut entry = entry_with_value(&blob);
         sanitize_entry(&mut entry);
 

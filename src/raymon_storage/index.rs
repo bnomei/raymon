@@ -266,15 +266,14 @@ impl IndexRecord {
             }
         }
 
-        if !filters.types.is_empty() {
-            if self.types.is_empty()
+        if !filters.types.is_empty()
+            && (self.types.is_empty()
                 || !filters
                     .types
                     .iter()
-                    .any(|filter_type| self.types.iter().any(|value| value == filter_type))
-            {
-                return false;
-            }
+                    .any(|filter_type| self.types.iter().any(|value| value == filter_type)))
+        {
+            return false;
         }
 
         if !filters.colors.is_empty() {
@@ -353,12 +352,8 @@ fn strip_regex_delimiters(query: &str) -> Option<&str> {
 }
 
 fn compile_regex(pattern: &str) -> Result<Regex, CoreFilterError> {
-    RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .build()
-        .map_err(|error| CoreFilterError::InvalidRegex {
-        pattern: pattern.to_string(),
-        message: error.to_string(),
+    RegexBuilder::new(pattern).case_insensitive(true).build().map_err(|error| {
+        CoreFilterError::InvalidRegex { pattern: pattern.to_string(), message: error.to_string() }
     })
 }
 

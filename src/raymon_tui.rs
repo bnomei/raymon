@@ -536,10 +536,10 @@ pub enum ActionOutcome {
 /// Results for detail search operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailSearchResult {
-    TextMatch,
-    JsonPathMatch,
-    JqMatch(String),
-    NoMatch,
+    Text,
+    JsonPath(String),
+    Jq(String),
+    NotFound,
 }
 
 /// Errors raised by the TUI.
@@ -612,7 +612,6 @@ struct DetailStats {
 struct DetailCache {
     key: DetailCacheKey,
     timestamp_iso: Option<String>,
-    text: String,
     render: Text<'static>,
     display_stats: DetailStats,
     blob_stats: DetailStats,
@@ -688,8 +687,8 @@ impl Tui {
     }
 
     pub fn new(config: TuiConfig) -> Self {
-        let mut state = TuiState::default();
-        state.show_archives = config.show_archives_by_default;
+        let state =
+            TuiState { show_archives: config.show_archives_by_default, ..Default::default() };
         let now = Instant::now();
         let mut tui = Self {
             config,
@@ -712,8 +711,8 @@ impl Tui {
     }
 
     pub fn with_clipboard(config: TuiConfig, clipboard: Box<dyn Clipboard>) -> Self {
-        let mut state = TuiState::default();
-        state.show_archives = config.show_archives_by_default;
+        let state =
+            TuiState { show_archives: config.show_archives_by_default, ..Default::default() };
         let now = Instant::now();
         let mut tui = Self {
             config,
@@ -776,8 +775,7 @@ impl Tui {
             self.events_bucket_counts[self.events_bucket_idx] = 0;
         }
 
-        self.events_bucket_start =
-            self.events_bucket_start + Duration::from_secs((steps as u64) * BUCKET_SECS);
+        self.events_bucket_start += Duration::from_secs((steps as u64) * BUCKET_SECS);
         self.events_per_min = self.events_bucket_counts.iter().copied().sum();
     }
 
@@ -1187,7 +1185,7 @@ impl Tui {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(2)])
             .split(size);
-        let Some(top_area) = chunks.get(0).copied() else {
+        let Some(top_area) = chunks.first().copied() else {
             return Action::None;
         };
         let Some(main_area) = chunks.get(1).copied() else {
@@ -1390,12 +1388,27 @@ impl Tui {
     fn color_from_name(&self, value: &str) -> Option<Color> {
         match value.trim().to_ascii_lowercase().as_str() {
             "red" => Some(self.ansi_color(Ansi16::Red)),
+            "brightred" | "bright_red" | "lightred" | "light_red" => {
+                Some(self.ansi_color(Ansi16::BrightRed))
+            }
             "green" => Some(self.ansi_color(Ansi16::Green)),
+            "brightgreen" | "bright_green" | "lightgreen" | "light_green" => {
+                Some(self.ansi_color(Ansi16::BrightGreen))
+            }
             "blue" => Some(self.ansi_color(Ansi16::Blue)),
             "yellow" => Some(self.ansi_color(Ansi16::Yellow)),
             "orange" => Some(self.ansi_color(Ansi16::Yellow)),
+            "brightyellow" | "bright_yellow" | "lightyellow" | "light_yellow" => {
+                Some(self.ansi_color(Ansi16::BrightYellow))
+            }
             "purple" | "magenta" => Some(self.ansi_color(Ansi16::Magenta)),
+            "brightmagenta" | "bright_magenta" | "lightmagenta" | "light_magenta" => {
+                Some(self.ansi_color(Ansi16::BrightMagenta))
+            }
             "cyan" => Some(self.ansi_color(Ansi16::Cyan)),
+            "brightcyan" | "bright_cyan" | "lightcyan" | "light_cyan" => {
+                Some(self.ansi_color(Ansi16::BrightCyan))
+            }
             "white" => Some(self.ansi_color(Ansi16::BrightWhite)),
             "gray" | "grey" => Some(self.ansi_color(Ansi16::BrightBlack)),
             _ => None,
@@ -1622,27 +1635,6 @@ impl Tui {
         OFFICIAL_COLORS.iter().map(|color| (*color).to_string()).collect()
     }
 
-    fn select_log_index(&mut self, log_index: usize) {
-        if let Some(pos) = self.state.filtered.iter().position(|idx| *idx == log_index) {
-            self.state.selected = pos;
-            self.follow_tail = self.state.selected.saturating_add(1) >= self.state.filtered.len();
-            self.state.last_detail_search = None;
-            self.state.detail_notice = None;
-            self.state.detail_scroll = 0;
-            return;
-        }
-        self.state.search.clear();
-        self.state.search_error = None;
-        self.recompute_filter();
-        if let Some(pos) = self.state.filtered.iter().position(|idx| *idx == log_index) {
-            self.state.selected = pos;
-            self.follow_tail = self.state.selected.saturating_add(1) >= self.state.filtered.len();
-            self.state.last_detail_search = None;
-            self.state.detail_notice = None;
-            self.state.detail_scroll = 0;
-        }
-    }
-
     fn sync_picker_active_states(&mut self) {
         let Some(picker) = self.state.picker.as_mut() else {
             return;
@@ -1685,33 +1677,33 @@ impl Tui {
         let detail = match self.selected_entry() {
             Some(entry) => &entry.detail,
             None => {
-                self.state.last_detail_search = Some(DetailSearchResult::NoMatch);
-                return DetailSearchResult::NoMatch;
+                self.state.last_detail_search = Some(DetailSearchResult::NotFound);
+                return DetailSearchResult::NotFound;
             }
         };
 
         if detail.contains(query) {
-            self.state.last_detail_search = Some(DetailSearchResult::TextMatch);
-            return DetailSearchResult::TextMatch;
+            self.state.last_detail_search = Some(DetailSearchResult::Text);
+            return DetailSearchResult::Text;
         }
 
         let parsed: Value = match serde_json::from_str(detail) {
             Ok(value) => value,
             Err(_) => {
-                self.state.last_detail_search = Some(DetailSearchResult::NoMatch);
-                return DetailSearchResult::NoMatch;
+                self.state.last_detail_search = Some(DetailSearchResult::NotFound);
+                return DetailSearchResult::NotFound;
             }
         };
 
         if let Some(result) = json_path_match(&parsed, query) {
-            let outcome = DetailSearchResult::JqMatch(result);
+            let outcome = DetailSearchResult::JsonPath(result);
             self.state.last_detail_search = Some(outcome.clone());
             return outcome;
         }
 
         match self.run_jq(detail, query) {
             Ok(Some(result)) => {
-                let outcome = DetailSearchResult::JqMatch(result);
+                let outcome = DetailSearchResult::Jq(result);
                 self.state.last_detail_search = Some(outcome.clone());
                 return outcome;
             }
@@ -1730,8 +1722,8 @@ impl Tui {
             }
         }
 
-        self.state.last_detail_search = Some(DetailSearchResult::NoMatch);
-        DetailSearchResult::NoMatch
+        self.state.last_detail_search = Some(DetailSearchResult::NotFound);
+        DetailSearchResult::NotFound
     }
 
     fn handle_normal(&mut self, key: KeyEvent) -> Action {
@@ -2351,11 +2343,6 @@ impl Tui {
         self.scroll_detail_by(direction.saturating_mul(step));
     }
 
-    fn clear_screen(&mut self) {
-        let screen = self.state.active_screen.clone();
-        self.clear_screen_for(screen.as_deref());
-    }
-
     pub fn clear_screen_for(&mut self, screen: Option<&str>) {
         let (logs, queued) = if self.viewing_archive.is_some() {
             let live = self.live_buffer.get_or_insert_with(LiveBuffer::default);
@@ -2561,9 +2548,7 @@ impl Tui {
         self.state.filtered = filtered;
         if self.state.filtered.is_empty() {
             self.state.selected = 0;
-        } else if self.follow_tail {
-            self.state.selected = self.state.filtered.len() - 1;
-        } else if self.state.selected >= self.state.filtered.len() {
+        } else if self.follow_tail || self.state.selected >= self.state.filtered.len() {
             self.state.selected = self.state.filtered.len() - 1;
         }
     }
@@ -3079,14 +3064,14 @@ impl Tui {
         spans.push(Span::raw("─ Logs "));
 
         let has_color_filters = !self.state.filters.colors.is_empty();
-        for (idx, color) in OFFICIAL_COLORS.iter().enumerate() {
+        for (idx, &color) in OFFICIAL_COLORS.iter().enumerate() {
             if idx > 0 {
                 spans.push(Span::raw(" "));
             }
-            let active = has_color_filters && self.state.filters.colors.contains(*color);
+            let active = has_color_filters && self.state.filters.colors.contains(color);
             let symbol = if active { "⏺" } else { "⊙" };
             let style = self
-                .color_from_name(*color)
+                .color_from_name(color)
                 .map(|color| self.base_style().fg(color))
                 .unwrap_or_else(|| self.base_style());
             spans.push(Span::styled(symbol.to_string(), style));
@@ -3221,9 +3206,11 @@ impl Tui {
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .thumb_style(thumb_style)
                     .track_style(self.dimmed_style());
-                let mut scrollbar_state = ScrollbarState::new(content_len)
+                let viewport_len = list_area.height as usize;
+                let scroll_len = content_len.saturating_sub(viewport_len).saturating_add(1);
+                let mut scrollbar_state = ScrollbarState::new(scroll_len)
                     .position(state.offset())
-                    .viewport_content_length(list_area.height as usize);
+                    .viewport_content_length(viewport_len);
                 frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
             }
         }
@@ -3278,8 +3265,10 @@ impl Tui {
             && !self.modal_open();
         let border_style = self.panel_border_style(focused);
         let title_style = self.panel_title_style(focused);
-        let transformed =
-            matches!(self.state.last_detail_search.as_ref(), Some(DetailSearchResult::JqMatch(_)));
+        let transformed = matches!(
+            self.state.last_detail_search.as_ref(),
+            Some(DetailSearchResult::JsonPath(_)) | Some(DetailSearchResult::Jq(_))
+        );
         let uuid = self.selected_entry().map(|entry| entry.uuid.clone());
         let (display_stats, blob_stats, timestamp_iso) = {
             let cached = self.detail_cached();
@@ -3408,9 +3397,11 @@ impl Tui {
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .thumb_style(thumb_style)
                     .track_style(self.dimmed_style());
-                let mut scrollbar_state = ScrollbarState::new(content_len)
+                let viewport_len = list_area.height as usize;
+                let scroll_len = content_len.saturating_sub(viewport_len).saturating_add(1);
+                let mut scrollbar_state = ScrollbarState::new(scroll_len)
                     .position(state.offset())
-                    .viewport_content_length(list_area.height as usize);
+                    .viewport_content_length(viewport_len);
                 frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
             }
         }
@@ -3821,9 +3812,11 @@ impl Tui {
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .thumb_style(self.base_style().fg(self.ansi_color(Ansi16::Green)))
                     .track_style(self.dimmed_style());
-                let mut scrollbar_state = ScrollbarState::new(content_len)
+                let viewport_len = list_area.height as usize;
+                let scroll_len = content_len.saturating_sub(viewport_len).saturating_add(1);
+                let mut scrollbar_state = ScrollbarState::new(scroll_len)
                     .position(state.offset())
-                    .viewport_content_length(list_area.height as usize);
+                    .viewport_content_length(viewport_len);
                 frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
             }
         }
@@ -3846,7 +3839,9 @@ impl Tui {
             None => (None, None),
         };
         let jq_fingerprint = match &self.state.last_detail_search {
-            Some(DetailSearchResult::JqMatch(result)) => Some(JqFingerprint::new(result)),
+            Some(DetailSearchResult::JsonPath(result)) | Some(DetailSearchResult::Jq(result)) => {
+                Some(JqFingerprint::new(result))
+            }
             _ => None,
         };
         DetailCacheKey {
@@ -3867,14 +3862,13 @@ impl Tui {
 
         if needs_refresh {
             let (text, is_json) = self.detail_text();
-            let render =
-                if is_json { self.json_syntax_highlight(&text) } else { Text::from(text.clone()) };
             let display_stats = detail_stats_for_text(&text);
+            let render = if is_json { self.json_syntax_highlight(&text) } else { Text::from(text) };
             let blob_text = self.detail_blob_text();
             let blob_stats = detail_stats_for_text(&blob_text);
             let timestamp_iso = key.entry_timestamp.and_then(format_iso_timestamp_millis);
             self.detail_cache =
-                Some(DetailCache { key, timestamp_iso, text, render, display_stats, blob_stats });
+                Some(DetailCache { key, timestamp_iso, render, display_stats, blob_stats });
             self.state.detail_scroll = 0;
         }
 
@@ -3885,7 +3879,9 @@ impl Tui {
         let Some(entry) = self.selected_entry() else {
             return "No selection.".to_string();
         };
-        if let Some(DetailSearchResult::JqMatch(result)) = &self.state.last_detail_search {
+        if let Some(DetailSearchResult::JsonPath(result) | DetailSearchResult::Jq(result)) =
+            &self.state.last_detail_search
+        {
             return result.clone();
         }
         entry.detail.clone()
@@ -3895,7 +3891,9 @@ impl Tui {
         let Some(entry) = self.selected_entry() else {
             return ("No selection.".to_string(), false);
         };
-        if let Some(DetailSearchResult::JqMatch(result)) = &self.state.last_detail_search {
+        if let Some(DetailSearchResult::JsonPath(result) | DetailSearchResult::Jq(result)) =
+            &self.state.last_detail_search
+        {
             let is_json = serde_json::from_str::<Value>(result).is_ok();
             return (result.clone(), is_json);
         }
@@ -3919,6 +3917,15 @@ impl Tui {
         let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
         if let Some(screen) = &self.state.active_screen {
             parts.push(vec![Span::raw("screen="), Span::raw(screen.clone())]);
+        }
+        if !self.state.filters.types.is_empty() {
+            let summary = summarize_set(&self.state.filters.types);
+            parts.push(vec![Span::raw("types="), Span::raw(summary)]);
+        }
+        if !self.state.filters.colors.is_empty() {
+            let mut part = vec![Span::raw("colors=")];
+            part.extend(self.summarize_color_set(&self.state.filters.colors));
+            parts.push(part);
         }
         if parts.is_empty() {
             None
@@ -4263,19 +4270,19 @@ fn json_highlight_segments(input: &str) -> Vec<(JsonHighlightKind, &str)> {
                 out.push((JsonHighlightKind::Number, &input[start..i]));
                 json_after_value(&mut context);
             }
-            b't' if input[i..].as_bytes().starts_with(b"true") => {
+            b't' if bytes[i..].starts_with(b"true") => {
                 let start = i;
                 i += 4;
                 out.push((JsonHighlightKind::Bool, &input[start..i]));
                 json_after_value(&mut context);
             }
-            b'f' if input[i..].as_bytes().starts_with(b"false") => {
+            b'f' if bytes[i..].starts_with(b"false") => {
                 let start = i;
                 i += 5;
                 out.push((JsonHighlightKind::Bool, &input[start..i]));
                 json_after_value(&mut context);
             }
-            b'n' if input[i..].as_bytes().starts_with(b"null") => {
+            b'n' if bytes[i..].starts_with(b"null") => {
                 let start = i;
                 i += 4;
                 out.push((JsonHighlightKind::Null, &input[start..i]));
@@ -4451,7 +4458,7 @@ fn format_iso_timestamp_millis(timestamp_millis: u64) -> Option<String> {
 }
 
 fn detail_stats_for_text(text: &str) -> DetailStats {
-    let bytes = text.as_bytes().len();
+    let bytes = text.len();
     let lines = if text.is_empty() { 0 } else { text.lines().count() };
     let tokens = o200k_base_singleton().encode_with_special_tokens(text).len();
     DetailStats { lines, bytes, tokens }
@@ -4504,7 +4511,7 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool
     false
 }
 
-pub(crate) fn fuzzy_rank_items(items: &[PickerItem], query: &str) -> Vec<usize> {
+pub fn fuzzy_rank_items(items: &[PickerItem], query: &str) -> Vec<usize> {
     let query_lower = query.to_lowercase();
     let threshold = if query_lower.len() <= 2 { 0.2 } else { 0.35 };
     #[cfg(feature = "rayon")]
@@ -5278,7 +5285,7 @@ mod tests {
         tui.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             tui.state.last_detail_search,
-            Some(DetailSearchResult::JsonPathMatch) | Some(DetailSearchResult::JqMatch(_))
+            Some(DetailSearchResult::JsonPath(_)) | Some(DetailSearchResult::Jq(_))
         ));
     }
 
@@ -5308,7 +5315,7 @@ mod tests {
 
     #[test]
     fn parse_regex_input_variants() {
-        assert!(matches!(parse_regex_input("nope"), None));
+        assert!(parse_regex_input("nope").is_none());
         assert!(matches!(parse_regex_input("/"), Some(Err(_))));
         assert!(matches!(parse_regex_input("/abc"), Some(Err(_))));
         assert!(matches!(parse_regex_input("/abc/"), Some(Ok("abc"))));
@@ -5761,18 +5768,15 @@ mod tests {
     #[test]
     fn live_archive_batches_flushes() {
         let dir = tempdir().expect("tempdir");
-        let mut config = TuiConfig::default();
-        config.archive_dir = Some(dir.path().to_path_buf());
+        let config =
+            TuiConfig { archive_dir: Some(dir.path().to_path_buf()), ..Default::default() };
 
         let value = Arc::new(Mutex::new(String::new()));
         let clipboard = MockClipboard { value };
         let mut tui = Tui::with_clipboard(config, Box::new(clipboard));
 
-        let live_path = tui
-            .live_archive
-            .as_ref()
-            .map(|live| live.path.clone())
-            .expect("live archive");
+        let live_path =
+            tui.live_archive.as_ref().map(|live| live.path.clone()).expect("live archive");
         assert_eq!(fs::metadata(&live_path).expect("metadata").len(), 0);
 
         let entry = LogEntry {
