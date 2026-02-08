@@ -2,6 +2,7 @@
 
 [![Crates.io Version](https://img.shields.io/crates/v/raymon)](https://crates.io/crates/raymon)
 [![CI](https://img.shields.io/github/actions/workflow/status/bnomei/tmux-mcp/ci.yml?branch=main)](https://github.com/bnomei/tmux-mcp/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json&style=flat)](https://codspeed.io/bnomei/raymon?utm_source=badge)
 [![Crates.io Downloads](https://img.shields.io/crates/d/raymon)](https://crates.io/crates/raymon)
 [![License](https://img.shields.io/crates/l/raymon)](https://crates.io/crates/raymon)
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
@@ -206,7 +207,7 @@ This repo includes a [skill](https://agentskills.io) at `skills/raymon/SKILL.md`
 
 ## TUI
 
-The TUI is intentionally “editor-like” (vim-ish):
+The TUI is intentionally "editor-like" (vim-ish):
 - `?` opens keybindings/help.
 - `q` quits (and shuts down the HTTP/MCP server).
 - `Space` opens the pickers/filters modal.
@@ -228,7 +229,7 @@ The TUI is intentionally “editor-like” (vim-ish):
 
 ### Theming
 
-Raymon sticks to the terminal’s ANSI palette (16 colors + text attributes like bold/dim/reverse), so it inherits your terminal theme (light/dark, base16, etc) without implementing full app theming. You can also enforce a set of colors via an `RAYMON_TUI_PALETTE` environment variable.
+Raymon sticks to the terminal's ANSI palette (16 colors + text attributes like bold/dim/reverse), so it inherits your terminal theme (light/dark, base16, etc)without implementing full app theming. You can also enforce a set of colors via an `RAYMON_TUI_PALETTE` environment variable.
 
 ## Configuration
 
@@ -241,8 +242,8 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_PORT` | `23517` | Bind port for the HTTP server. |
 | `RAYMON_TUI` | `true` | Enable the TUI. |
 | `RAYMON_NO_TUI` | `false` | Disable the TUI (takes precedence over `RAYMON_TUI`). |
-| `RAYMON_IDE` | `code` | IDE command used for “open origin” (for VS Code line jumps, use `code --goto`). |
-| `RAYMON_EDITOR` | `VISUAL`/`EDITOR`/`vim` | Editor command used for “open in editor”. |
+| `RAYMON_IDE` | `code` | IDE command used for "open origin" (for VS Code line jumps, use `code --goto`). |
+| `RAYMON_EDITOR` | `VISUAL`/`EDITOR`/`vim` | Editor command used for "open in editor". |
 | `RAYMON_JQ` | `jq` | `jq` command used for detail search. |
 | `RAYMON_TUI_PALETTE` | unset | Optional TUI palette override: 18 comma-separated colors `fg,bg,black,red,green,yellow,blue,magenta,cyan,white,bright_black,bright_red,bright_green,bright_yellow,bright_blue,bright_magenta,bright_cyan,bright_white` as `#RRGGBB` (also accepts `rgb:RRRR/GGGG/BBBB`). |
 | `RAYMON_PALETTE` | unset | Alias for `RAYMON_TUI_PALETTE`. |
