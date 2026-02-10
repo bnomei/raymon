@@ -413,6 +413,7 @@ pub struct TuiState {
     pub archive_selected: usize,
     pub json_expanded: bool,
     pub json_raw: bool,
+    pub show_decorators: bool,
     pub show_timestamp: bool,
     pub show_filename: bool,
     pub show_color_indicator: bool,
@@ -456,6 +457,7 @@ impl Default for TuiState {
             archive_selected: 0,
             json_expanded: true,
             json_raw: false,
+            show_decorators: false,
             show_timestamp: false,
             show_filename: false,
             show_color_indicator: true,
@@ -598,6 +600,7 @@ struct DetailCacheKey {
     entry_timestamp: Option<u64>,
     json_expanded: bool,
     json_raw: bool,
+    show_decorators: bool,
     jq_fingerprint: Option<JqFingerprint>,
 }
 
@@ -1899,6 +1902,11 @@ impl Tui {
                 self.state.detail_scroll = 0;
                 Action::None
             }
+            KeyEvent { code: KeyCode::Char('m'), modifiers: KeyModifiers::NONE, .. } => {
+                self.state.show_decorators = !self.state.show_decorators;
+                self.state.detail_scroll = 0;
+                Action::None
+            }
             KeyEvent { code: KeyCode::Char('Z'), modifiers, .. }
                 if !modifiers.contains(KeyModifiers::CONTROL)
                     && !modifiers.contains(KeyModifiers::ALT) =>
@@ -2589,10 +2597,12 @@ impl Tui {
     }
 
     fn yank_selected(&mut self, kind: YankKind) -> Result<(), TuiError> {
-        let entry = self.selected_entry().ok_or(TuiError::NoSelection)?;
+        if self.selected_entry().is_none() {
+            return Err(TuiError::NoSelection);
+        }
         let contents = match kind {
-            YankKind::Message => entry.message.clone(),
-            YankKind::Detail => entry.detail.clone(),
+            YankKind::Message => self.selected_entry().expect("selection checked").message.clone(),
+            YankKind::Detail => self.detail_text().0,
         };
         self.clipboard.set(&contents)?;
         self.state.last_yank = Some(contents);
@@ -3012,10 +3022,6 @@ impl Tui {
             Span::raw(" "),
             Span::styled(query.to_string(), query_style),
         ];
-        if let Some(summary) = self.filters_summary() {
-            spans.push(Span::raw(" Filters: "));
-            spans.extend(summary);
-        }
         if let Some(error) = &self.state.search_error {
             spans.push(Span::styled(
                 format!(" Error: {}", error),
@@ -3063,6 +3069,14 @@ impl Tui {
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::raw("─ Logs "));
 
+        if let Some(screen) = &self.state.active_screen {
+            spans.push(Span::styled(
+                format!("@{screen}"),
+                self.base_style().fg(self.ansi_color(Ansi16::Cyan)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+
         let has_color_filters = !self.state.filters.colors.is_empty();
         for (idx, &color) in OFFICIAL_COLORS.iter().enumerate() {
             if idx > 0 {
@@ -3082,7 +3096,7 @@ impl Tui {
         let types = if self.state.filters.types.is_empty() {
             " ".to_string()
         } else {
-            self.state.filters.types.iter().cloned().collect::<Vec<_>>().join(",")
+            summarize_set(&self.state.filters.types)
         };
         spans.push(Span::raw(format!("[{types}]")));
         spans.push(Span::raw(" "));
@@ -3465,6 +3479,7 @@ impl Tui {
                     FocusPane::Detail => {
                         push_item(&mut spans, "Move", "j/k");
                         push_item(&mut spans, "Scroll", "J/K");
+                        push_item(&mut spans, "Meta", "m");
                         push_item(&mut spans, "Edit", "e");
                         push_item(&mut spans, "Open", "o");
                         push_item(&mut spans, "Yank", "y/Y");
@@ -3576,6 +3591,7 @@ impl Tui {
                 text.push(kv("n", "Rename selected archive (Archives pane)"));
                 text.push(kv("d", "Delete selected archive (Archives pane)"));
                 text.push(kv("z / Z", "Toggle JSON expanded / raw"));
+                text.push(kv("m", "Toggle style/meta payloads in detail"));
                 text.push(kv("1-6", "Toggle color/timestamp/type label/file/message/uuid"));
                 text.push(Line::from(""));
                 text.push(Line::from(Span::styled("--- Pickers ---", header_style)));
@@ -3849,6 +3865,7 @@ impl Tui {
             entry_timestamp,
             json_expanded: self.state.json_expanded,
             json_raw: self.state.json_raw,
+            show_decorators: self.state.show_decorators,
             jq_fingerprint,
         }
     }
@@ -3897,78 +3914,26 @@ impl Tui {
             let is_json = serde_json::from_str::<Value>(result).is_ok();
             return (result.clone(), is_json);
         }
-        if let Ok(value) = serde_json::from_str::<Value>(&entry.detail) {
-            if self.state.json_expanded {
-                let text = if self.state.json_raw {
-                    entry.detail.clone()
-                } else {
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| entry.detail.clone())
-                };
-                (text, true)
+
+        let parsed = match serde_json::from_str::<Value>(&entry.detail) {
+            Ok(value) => value,
+            Err(_) => return (entry.detail.clone(), false),
+        };
+
+        let decorated = detail_value_with_decorators(parsed, self.state.show_decorators);
+
+        if self.state.json_expanded {
+            let compact =
+                serde_json::to_string(&decorated).unwrap_or_else(|_| entry.detail.clone());
+            let text = if self.state.json_raw {
+                compact
             } else {
-                (json_summary(&value), false)
-            }
+                serde_json::to_string_pretty(&decorated).unwrap_or(compact)
+            };
+            (text, true)
         } else {
-            (entry.detail.clone(), false)
+            (json_summary(&decorated), false)
         }
-    }
-
-    fn filters_summary(&self) -> Option<Vec<Span<'static>>> {
-        let mut parts: Vec<Vec<Span<'static>>> = Vec::new();
-        if let Some(screen) = &self.state.active_screen {
-            parts.push(vec![Span::raw("screen="), Span::raw(screen.clone())]);
-        }
-        if !self.state.filters.types.is_empty() {
-            let summary = summarize_set(&self.state.filters.types);
-            parts.push(vec![Span::raw("types="), Span::raw(summary)]);
-        }
-        if !self.state.filters.colors.is_empty() {
-            let mut part = vec![Span::raw("colors=")];
-            part.extend(self.summarize_color_set(&self.state.filters.colors));
-            parts.push(part);
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            let mut spans = Vec::new();
-            for (idx, part) in parts.into_iter().enumerate() {
-                if idx > 0 {
-                    spans.push(Span::raw(" | "));
-                }
-                spans.extend(part);
-            }
-            Some(spans)
-        }
-    }
-
-    fn summarize_color_set(&self, set: &BTreeSet<String>) -> Vec<Span<'static>> {
-        let mut iter = set.iter();
-        let mut labels = Vec::new();
-        for _ in 0..3 {
-            if let Some(value) = iter.next() {
-                labels.push(value.clone());
-            } else {
-                break;
-            }
-        }
-
-        let mut spans = Vec::new();
-        for (idx, label) in labels.iter().enumerate() {
-            if idx > 0 {
-                spans.push(Span::raw(","));
-            }
-            if let Some(color) = self.color_from_name(label) {
-                spans.push(Span::styled(label.clone(), self.base_style().fg(color)));
-            } else {
-                spans.push(Span::raw(label.clone()));
-            }
-        }
-
-        if set.len() > labels.len() {
-            spans.push(Span::raw(format!(" +{}", set.len() - labels.len())));
-        }
-
-        spans
     }
 
     fn regex_filter(&self, indices: &[usize], regex: &regex::Regex) -> Vec<usize> {
@@ -4084,6 +4049,60 @@ enum PickerAction {
     Select(PickerItemId),
     Toggle(PickerItemId),
     Paste,
+}
+
+fn detail_value_with_decorators(value: Value, show_decorators: bool) -> Value {
+    let Value::Array(items) = value else {
+        return value;
+    };
+
+    let mut content = Vec::new();
+    let mut decorators = Vec::new();
+
+    for item in items {
+        if is_styling_payload_value(&item) {
+            decorators.push(item);
+        } else {
+            content.push(item);
+        }
+    }
+
+    if decorators.is_empty() {
+        return Value::Array(content);
+    }
+
+    if show_decorators {
+        let mut map = serde_json::Map::new();
+        map.insert("content".to_string(), Value::Array(content));
+        map.insert("decorators".to_string(), Value::Array(decorators));
+        Value::Object(map)
+    } else {
+        Value::Array(content)
+    }
+}
+
+fn is_styling_payload_value(value: &Value) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+
+    if map.len() != 1 {
+        return false;
+    }
+
+    if let Some(value) = map.get("color").and_then(|value| value.as_str()) {
+        return canonical_color_name(value).is_some();
+    }
+
+    if let Some(value) = map.get("label").and_then(|value| value.as_str()) {
+        return !value.trim().is_empty();
+    }
+
+    if let Some(value) = map.get("size").and_then(|value| value.as_str()) {
+        return matches!(value.trim().to_ascii_lowercase().as_str(), "small" | "normal" | "large");
+    }
+
+    false
 }
 
 fn json_summary(value: &Value) -> String {
@@ -5330,6 +5349,20 @@ mod tests {
 
         let array = serde_json::json!([1, 2, 3]);
         assert_eq!(json_summary(&array), "JSON (collapsed): array [3]");
+    }
+
+    #[test]
+    fn detail_value_decorator_split_hides_color_like_values() {
+        let value = serde_json::json!(["hello", {"color": "red"}, {"a": 1}, {"label": "Foo"}]);
+
+        let hidden = detail_value_with_decorators(value.clone(), false);
+        assert_eq!(hidden, serde_json::json!(["hello", {"a": 1}]));
+
+        let shown = detail_value_with_decorators(value, true);
+        assert_eq!(
+            shown,
+            serde_json::json!({"content":["hello", {"a": 1}], "decorators":[{"color":"red"}, {"label":"Foo"}]})
+        );
     }
 
     #[test]
