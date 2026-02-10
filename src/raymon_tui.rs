@@ -522,6 +522,7 @@ impl Clipboard for SystemClipboard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
+    ClearLogs,
     OpenEditor,
     OpenOrigin,
     Quit,
@@ -1326,6 +1327,9 @@ impl Tui {
     pub fn perform_action(&mut self, action: Action) -> Result<ActionOutcome, TuiError> {
         match action {
             Action::None => Err(TuiError::InvalidCommandLine("no action".to_string())),
+            Action::ClearLogs => Err(TuiError::InvalidCommandLine(
+                "clear logs is handled by the runtime".to_string(),
+            )),
             Action::OpenEditor => {
                 let path = self.open_in_editor()?;
                 Ok(ActionOutcome::OpenedEditor(path))
@@ -1731,6 +1735,11 @@ impl Tui {
 
     fn handle_normal(&mut self, key: KeyEvent) -> Action {
         match key {
+            KeyEvent { code: KeyCode::Char('l' | 'L'), modifiers, .. }
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::ClearLogs
+            }
             KeyEvent { code: KeyCode::Char('j'), modifiers: KeyModifiers::NONE, .. } => {
                 match self.state.focus {
                     FocusPane::Logs => self.move_selection(1),
@@ -2384,6 +2393,7 @@ impl Tui {
 
         // Only recompute the view filter if we're clearing the currently viewed dataset.
         if self.viewing_archive.is_none() {
+            self.rebuild_screens();
             self.state.filtered.clear();
             self.state.selected = 0;
             self.follow_tail = false;
@@ -3579,6 +3589,7 @@ impl Tui {
                 text.push(kv("G", "Jump to last log"));
                 text.push(kv("s", "Snap color + type filters to selected log"));
                 text.push(kv("p", "Pause/resume live updates"));
+                text.push(kv("Ctrl+l", "Clear live logs list"));
                 text.push(kv("x", "Archive current view to file"));
                 text.push(kv("y", "Yank message"));
                 text.push(kv("Y", "Yank detail"));
@@ -5848,6 +5859,13 @@ mod tests {
         let (mut tui, _) = make_tui();
         let action = tui.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(action, Action::Quit);
+    }
+
+    #[rstest]
+    fn ctrl_l_clears_logs() {
+        let (mut tui, _) = make_tui();
+        let action = tui.handle_key(key(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(action, Action::ClearLogs);
     }
 
     #[rstest]

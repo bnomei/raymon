@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 - hide colors/label/size meta from DETAIL
 - make default CLI output quiet; add `-v/--verbose` logging
+- add `Ctrl+l` to clear the live log list in the TUI
 
 ## [0.1.0] - 2026-02-08
 - Initial Release

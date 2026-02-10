@@ -223,6 +223,7 @@ The TUI is intentionally "editor-like" (vim-ish):
 - `z` toggles JSON expanded/collapsed (default: expanded), `Z` toggles raw JSON.
 - `u` resets search + filters (screens/types/colors).
 - `Ctrl+y` pastes the yank register into inputs.
+- `Ctrl+l` clears the live log list (does not delete stored entries).
 - `1` toggles color dot, `2` timestamp, `3` type label, `4` file, `5` message, `6` uuid (short).
 - `o` opens the origin in your IDE (see `RAYMON_IDE`), `e` opens the detail in `$EDITOR` via a temp file.
 - In the Archives pane, `Enter` loads the selected archive; the green `‣` row returns to live (`◼` = active archive, `◻` = inactive).

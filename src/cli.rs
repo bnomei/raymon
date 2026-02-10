@@ -1347,8 +1347,9 @@ async fn run_tui(
     }
 
     let started_at = crate::raymon_ingest::now_millis();
+    let (clear_tx, clear_rx) = watch::channel(started_at);
     let forward_handle =
-        tokio::spawn(forward_events_to_ui(event_rx, log_tx_forward, core, started_at));
+        tokio::spawn(forward_events_to_ui(event_rx, clear_rx, log_tx_forward, core));
 
     let shutdown_handle = tokio::spawn(async move {
         let _ = shutdown.recv().await;
@@ -1357,7 +1358,7 @@ async fn run_tui(
     });
 
     tokio::task::spawn_blocking(move || {
-        run_tui_loop(config, log_rx, running, shutdown_tx, pause_tx)
+        run_tui_loop(config, log_rx, running, shutdown_tx, pause_tx, clear_tx)
     })
     .await??;
 
@@ -1373,6 +1374,7 @@ fn run_tui_loop(
     running: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
     pause_tx: Option<watch::Sender<bool>>,
+    clear_tx: watch::Sender<u64>,
 ) -> Result<(), DynError> {
     let _guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
@@ -1425,6 +1427,11 @@ fn run_tui_loop(
                             let _ = pause_tx.send(now_paused);
                         }
                     }
+                    if action == Action::ClearLogs {
+                        tui.clear_screen_for(None);
+                        let _ = clear_tx.send(crate::raymon_ingest::now_millis());
+                        continue;
+                    }
                     if action == Action::Quit {
                         let _ = shutdown_tx.send(());
                         running.store(false, Ordering::SeqCst);
@@ -1460,6 +1467,11 @@ fn run_tui_loop(
                         running.store(false, Ordering::SeqCst);
                         break;
                     }
+                    if action == Action::ClearLogs {
+                        tui.clear_screen_for(None);
+                        let _ = clear_tx.send(crate::raymon_ingest::now_millis());
+                        continue;
+                    }
                     if action != Action::None {
                         if matches!(action, Action::OpenEditor | Action::OpenOrigin) {
                             match TerminalSuspendGuard::new(&mut terminal) {
@@ -1493,64 +1505,91 @@ fn run_tui_loop(
 
 async fn forward_events_to_ui(
     mut event_rx: broadcast::Receiver<CoreEvent>,
+    mut clear_epoch: watch::Receiver<u64>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     core: CoreState,
-    started_at: u64,
 ) {
+    let mut started_at = *clear_epoch.borrow();
     let mut seen_uuids: HashSet<String> = HashSet::new();
     let mut dropped_total: usize = 0;
 
     loop {
-        match event_rx.recv().await {
-            Ok(event) => {
-                let ui_event = match event {
-                    CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
-                        seen_uuids.insert(entry.uuid.clone());
-                        Some(UiEvent::Log(log_entry_from_core(&entry)))
-                    }
-                    CoreEvent::ScreenCleared(screen) => {
-                        Some(UiEvent::ClearScreen(screen.as_str().to_string()))
-                    }
-                    CoreEvent::StateCleared => Some(UiEvent::ClearAll),
-                };
-
-                if let Some(ui_event) = ui_event {
-                    if ui_tx.send(ui_event).is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                dropped_total =
-                    dropped_total.saturating_add((skipped.min(usize::MAX as u64)) as usize);
-
-                let entries = match core.list(&Filters::default()) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        let _ = ui_tx.send(UiEvent::Notice(format!(
-                            "Dropped {dropped_total} events; resync failed: {error}"
-                        )));
-                        dropped_total = 0;
-                        continue;
-                    }
-                };
-
-                let mut logs = Vec::new();
-                for entry in entries {
-                    if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
-                        logs.push(log_entry_from_core(&entry));
-                    }
-                }
-                for log in &logs {
-                    seen_uuids.insert(log.uuid.clone());
-                }
-
-                if ui_tx.send(UiEvent::Resync { dropped: dropped_total, logs }).is_err() {
+        tokio::select! {
+            biased;
+            res = clear_epoch.changed() => {
+                if res.is_err() {
                     break;
                 }
+                started_at = *clear_epoch.borrow();
+                seen_uuids.clear();
                 dropped_total = 0;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            res = event_rx.recv() => match res {
+                Ok(event) => {
+                    let ui_event = match event {
+                        CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
+                            seen_uuids.insert(entry.uuid.clone());
+                            Some(UiEvent::Log(log_entry_from_core(&entry)))
+                        }
+                        CoreEvent::ScreenCleared(screen) => {
+                            Some(UiEvent::ClearScreen(screen.as_str().to_string()))
+                        }
+                        CoreEvent::StateCleared => Some(UiEvent::ClearAll),
+                    };
+
+                    if let Some(ui_event) = ui_event {
+                        if ui_tx.send(ui_event).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    dropped_total =
+                        dropped_total.saturating_add((skipped.min(usize::MAX as u64)) as usize);
+                    let epoch = *clear_epoch.borrow();
+
+                    // If the clear epoch advanced while we were lagging, treat this as a new
+                    // session window and avoid replaying the old view.
+                    if epoch != started_at {
+                        started_at = epoch;
+                        seen_uuids.clear();
+                        dropped_total = 0;
+                    }
+
+                    let entries = match core.list(&Filters::default()) {
+                        Ok(entries) => entries,
+                        Err(error) => {
+                            let _ = ui_tx.send(UiEvent::Notice(format!(
+                                "Dropped {dropped_total} events; resync failed: {error}"
+                            )));
+                            dropped_total = 0;
+                            continue;
+                        }
+                    };
+
+                    // If the user cleared the log list while the resync was in-flight, drop this
+                    // resync result so the clear stays in effect.
+                    if *clear_epoch.borrow() != epoch {
+                        continue;
+                    }
+
+                    let mut logs = Vec::new();
+                    for entry in entries {
+                        if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
+                            logs.push(log_entry_from_core(&entry));
+                        }
+                    }
+                    for log in &logs {
+                        seen_uuids.insert(log.uuid.clone());
+                    }
+
+                    if ui_tx.send(UiEvent::Resync { dropped: dropped_total, logs }).is_err() {
+                        break;
+                    }
+                    dropped_total = 0;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     }
 }
@@ -2771,7 +2810,8 @@ mod tests {
         }
 
         let (ui_tx, ui_rx) = std::sync::mpsc::channel();
-        let forward_handle = tokio::spawn(forward_events_to_ui(event_rx, ui_tx, core, 0));
+        let (_clear_tx, clear_rx) = watch::channel(0u64);
+        let forward_handle = tokio::spawn(forward_events_to_ui(event_rx, clear_rx, ui_tx, core));
 
         let first = tokio::task::spawn_blocking(move || {
             ui_rx.recv_timeout(Duration::from_secs(1)).expect("ui event")
