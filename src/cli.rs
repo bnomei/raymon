@@ -51,6 +51,7 @@ use tokio::{
 };
 use tower::ServiceExt;
 use tracing::{info, warn};
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use uuid::Uuid;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -100,6 +101,9 @@ struct Cli {
     no_tui: bool,
     #[arg(long, action = clap::ArgAction::SetTrue, global = true)]
     demo: bool,
+    /// Increase logging verbosity (-v, -vv). Can also be controlled via RAYMON_LOG/RUST_LOG.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -2095,9 +2099,8 @@ async fn run_demo(
 /// Resolves configuration from CLI args, environment variables and an optional `ray.json`, then
 /// starts the HTTP ingest/MCP server and (unless disabled) the terminal UI.
 pub async fn run() -> Result<(), DynError> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
-
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
     let cwd = env::current_dir()?;
     let env_map: BTreeMap<String, String> = env::vars().collect();
     let (config, config_path) = resolve_config(&cli, &cwd, &env_map)?;
@@ -2254,6 +2257,28 @@ pub async fn run() -> Result<(), DynError> {
     Ok(())
 }
 
+fn init_tracing(verbose: u8) {
+    let default_level = match verbose {
+        0 => LevelFilter::OFF,
+        1 => LevelFilter::INFO,
+        _ => LevelFilter::DEBUG,
+    };
+
+    let builder = EnvFilter::builder().with_default_directive(default_level.into());
+    let directives = env::var("RAYMON_LOG")
+        .or_else(|_| env::var("RUST_LOG"))
+        .unwrap_or_default();
+
+    let filter = builder
+        .parse(directives)
+        .unwrap_or_else(|_| builder.parse("").expect("default env filter parses"));
+
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2324,6 +2349,7 @@ mod tests {
             tui: false,
             no_tui: true,
             demo: false,
+            verbose: 0,
         };
 
         let (config, resolved_path) = resolve_config(&cli, &child, &env_map).unwrap();
