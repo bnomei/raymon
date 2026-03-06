@@ -260,6 +260,14 @@ Raymon is configured primarily via environment variables:
 
 Raymon also supports a `ray.json` config file (searched from the current directory upwards). Keys mirror env vars (e.g. `host`, `port`, `tui`, `max_entries`, `storage_max_entries`). CLI flags override env and file config.
 
+## Local Pre-commit
+
+```bash
+prek validate-config prek.toml
+prek run --all-files
+prek install
+```
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
