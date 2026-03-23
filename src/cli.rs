@@ -2304,18 +2304,14 @@ fn init_tracing(verbose: u8) {
     };
 
     let builder = EnvFilter::builder().with_default_directive(default_level.into());
-    let directives = env::var("RAYMON_LOG")
-        .or_else(|_| env::var("RUST_LOG"))
-        .unwrap_or_default();
+    let directives = env::var("RAYMON_LOG").or_else(|_| env::var("RUST_LOG")).unwrap_or_default();
 
     let filter = builder
         .parse(directives)
         .unwrap_or_else(|_| builder.parse("").expect("default env filter parses"));
 
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .try_init();
+    let _ =
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).try_init();
 }
 
 #[cfg(test)]
