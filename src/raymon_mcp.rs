@@ -343,11 +343,8 @@ where
     B::Subscription: EventStream + Send + 'static,
 {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Raymon MCP server".to_string()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Raymon MCP server")
     }
 
     async fn initialize(
