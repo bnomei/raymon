@@ -136,6 +136,7 @@ Tools and their input/output shapes:
     "offset": "number (optional)"
   }
   ```
+  `types` and `colors` also accept comma-separated strings, e.g. `{ "types": "error,exception" }`.
 
   Result:
   ```json
@@ -164,7 +165,9 @@ Tools and their input/output shapes:
   ```json
   { "uuids": ["string"] }
   ```
-  Fallback (legacy/single): `{ "uuid": "string" }`
+  Fallback (legacy/single): `{ "uuid": "string" }`.
+  String values also accept comma-separated UUIDs: `{ "uuids": "id-1,id-2" }`.
+  In comma-separated string form, whitespace in each UUID token is ignored.
 
   Result:
   ```json

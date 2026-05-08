@@ -120,6 +120,7 @@ Example params:
   "colors": ["red"]
 }
 ```
+`types` and `colors` may also be comma-separated strings, such as `"error,exception"`.
 
 4) From results, pick the `uuid` with the right `payload_types` and context.
 
@@ -133,6 +134,11 @@ Legacy/single form may work as:
 ```json
 { "uuid": "<uuid>" }
 ```
+String values may also accept a comma-separated UUID list:
+```json
+{ "uuids": "<uuid-1>,<uuid-2>" }
+```
+In comma-separated string form, whitespace in each UUID token is ignored.
 
 2) Read the entry payloads:
    - `payloads[*].type` tells you what kind of content it is.

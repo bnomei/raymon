@@ -11,7 +11,7 @@ use std::sync::{
 
 use crate::raymon_core::{Event, EventBus, Filters, Screen, StateStore};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{
         CustomNotification, CustomRequest, CustomResult, InitializeRequestParams, InitializeResult,
         ServerCapabilities, ServerInfo, ServerNotification,
@@ -110,7 +110,6 @@ pub struct RaymonMcp<S, B> {
     max_query_len: usize,
     peers: Arc<RwLock<Vec<rmcp::Peer<rmcp::RoleServer>>>>,
     forwarder_started: Arc<AtomicBool>,
-    tool_router: ToolRouter<Self>,
 }
 
 impl<S, B> RaymonMcp<S, B>
@@ -130,7 +129,6 @@ where
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -143,7 +141,6 @@ where
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -161,7 +158,6 @@ where
             max_query_len: max_query_len.max(1),
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -241,8 +237,8 @@ where
     fn map_filters(params: &ListEntriesParams) -> Filters {
         Filters {
             query: params.query.clone(),
-            types: params.types.clone(),
-            colors: params.colors.clone(),
+            types: params.types.to_vec(),
+            colors: params.colors.to_vec(),
             screen: params.screen.as_ref().map(|value| Screen::new(value.clone())),
             project: params.project.clone(),
             host: params.host.clone(),
@@ -387,13 +383,35 @@ where
 #[serde(default)]
 pub struct ListEntriesParams {
     query: Option<String>,
-    types: Vec<String>,
-    colors: Vec<String>,
+    types: StringListSelector,
+    colors: StringListSelector,
     screen: Option<String>,
     project: Option<String>,
     host: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum StringListSelector {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for StringListSelector {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl StringListSelector {
+    fn to_vec(&self) -> Vec<String> {
+        match self {
+            Self::One(value) => comma_separated_values(value),
+            Self::Many(values) => values.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -406,10 +424,21 @@ pub enum UuidSelector {
 impl UuidSelector {
     fn into_vec(self) -> Vec<String> {
         match self {
-            Self::One(uuid) => vec![uuid],
+            Self::One(uuid) if uuid.contains(',') => {
+                uuid.split(',').map(compact_uuid_segment).collect()
+            }
+            Self::One(uuid) => vec![uuid.trim().to_string()],
             Self::Many(uuids) => uuids,
         }
     }
+}
+
+fn comma_separated_values(value: &str) -> Vec<String> {
+    value.split(',').map(|segment| segment.trim().to_string()).collect()
+}
+
+fn compact_uuid_segment(uuid: &str) -> String {
+    uuid.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -721,18 +750,22 @@ mod tests {
         let bus_handle = bus.clone();
         let handler = RaymonMcp::new(store.clone(), bus);
 
-        let params = ListEntriesParams {
-            query: Some("alpha".to_string()),
-            screen: Some("main".to_string()),
-            limit: Some(10),
-            offset: Some(2),
-            ..Default::default()
-        };
+        let params: ListEntriesParams = serde_json::from_value(json!({
+            "query": "alpha",
+            "types": ["note"],
+            "colors": "red, blue",
+            "screen": "main",
+            "limit": 10,
+            "offset": 2
+        }))
+        .expect("search params should deserialize");
 
         handler.search(Parameters(params)).await.expect("search should succeed");
 
         let filters = store.last_filters.lock().unwrap().clone().expect("filters captured");
         assert_eq!(filters.query, Some("alpha".to_string()));
+        assert_eq!(filters.types, vec!["note"]);
+        assert_eq!(filters.colors, vec!["red", "blue"]);
         assert_eq!(filters.screen, Some(Screen::new("main")));
         assert_eq!(filters.limit, Some(10));
         assert_eq!(filters.offset, 2);
@@ -791,6 +824,31 @@ mod tests {
         let first = result.0.entries.first().expect("first entry");
         assert!(first.payload_count > 0);
         assert!(!first.payload_types.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_entries_accepts_comma_separated_uuid_string() {
+        let store = TestStore {
+            entries: vec![
+                sample_entry("entry-1"),
+                sample_entry("entry-2"),
+                sample_entry("entry-3"),
+            ],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+
+        let params: GetEntriesParams = serde_json::from_value(json!({
+            "uuids": "entry-1, entry-\n 3"
+        }))
+        .expect("get entries params should deserialize");
+
+        let result = handler.get_entries(Parameters(params)).await.unwrap();
+        let uuids = result.0.entries.into_iter().map(|entry| entry.uuid).collect::<Vec<_>>();
+
+        assert_eq!(uuids, vec!["entry-1", "entry-3"]);
     }
 
     #[tokio::test]

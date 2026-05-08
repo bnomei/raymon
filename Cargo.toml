@@ -1,9 +1,9 @@
 [package]
 name = "raymon"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.70"
+rust-version = "1.89"
 description = "Stateful MCP server and TUI for Ray-style logs"
 readme = "README.md"
 homepage = "https://github.com/bnomei/raymon"
