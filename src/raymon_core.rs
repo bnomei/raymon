@@ -424,7 +424,7 @@ pub mod filters {
                 let mut matched = Vec::new();
                 let mut skipped = 0usize;
 
-                for (entry, is_match) in entries.iter().zip(matches.into_iter()) {
+                for (entry, is_match) in entries.iter().zip(matches) {
                     if !is_match {
                         continue;
                     }

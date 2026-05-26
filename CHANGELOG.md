@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-26
+- upgrade `rmcp` to 1.7.0
+- add read-only, non-destructive MCP tool hints for Raymon search and fetch tools
+
 ## [0.3.0] - 2026-05-08
 - accept comma-separated string values for `raymon.get_entries` UUIDs
 - accept comma-separated string values for `raymon.search` `types` and `colors`

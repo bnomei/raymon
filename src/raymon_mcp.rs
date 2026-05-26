@@ -281,7 +281,16 @@ where
     B::Error: Display + Send + Sync + 'static,
     B::Subscription: EventStream + Send + 'static,
 {
-    #[tool(name = "raymon.search", description = "Search entries using Raymon filters")]
+    #[tool(
+        name = "raymon.search",
+        description = "Search entries using Raymon filters",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn search(
         &self,
         Parameters(params): Parameters<ListEntriesParams>,
@@ -304,7 +313,16 @@ where
         Ok(Json(ListEntriesResult { entries: summaries, count, limit, offset }))
     }
 
-    #[tool(name = "raymon.get_entries", description = "Fetch entries by UUID")]
+    #[tool(
+        name = "raymon.get_entries",
+        description = "Fetch entries by UUID",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn get_entries(
         &self,
         Parameters(params): Parameters<GetEntriesParams>,
@@ -598,7 +616,7 @@ mod tests {
     use super::*;
     use crate::raymon_core::{types::default_screen_name, Entry, Origin, Payload};
     use rmcp::handler::server::common::schema_for_type;
-    use rmcp::model::ErrorCode;
+    use rmcp::model::{ErrorCode, Tool};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -911,5 +929,19 @@ mod tests {
         let _ = schema_for_type::<GetEntriesParams>();
         let _ = schema_for_type::<ListEntriesResult>();
         let _ = schema_for_type::<GetEntriesResult>();
+    }
+
+    #[test]
+    fn tools_are_marked_read_only() {
+        assert_read_only_tool(RaymonMcp::<TestStore, TestBus>::search_tool_attr());
+        assert_read_only_tool(RaymonMcp::<TestStore, TestBus>::get_entries_tool_attr());
+    }
+
+    fn assert_read_only_tool(tool: Tool) {
+        let annotations = tool.annotations.expect("tool should expose annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
     }
 }
