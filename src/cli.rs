@@ -50,6 +50,7 @@ use tokio::{
     time,
 };
 use tower::ServiceExt;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use uuid::Uuid;
@@ -1664,6 +1665,7 @@ fn build_router(
     let router = Router::new()
         .route("/", post(ingest_or_mcp_handler))
         .route_service("/mcp", mcp_service)
+        .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware))
         .route_layer(middleware::from_fn_with_state(concurrency_state, concurrency_middleware))
@@ -2824,5 +2826,29 @@ mod tests {
         }
 
         forward_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_requests_respect_body_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, _) = build_state(temp.path(), false, 0, 0).expect("build state");
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+        let router =
+            build_router(state, shutdown_tx, None, 16, DEFAULT_MAX_QUERY_LEN).expect("router");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(axum::http::header::CONTENT_LENGTH, "17")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("x".repeat(17)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
