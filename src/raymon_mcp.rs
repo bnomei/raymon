@@ -111,6 +111,7 @@ pub struct RaymonMcp<S, B> {
     state: S,
     bus: B,
     shutdown: Option<broadcast::Sender<()>>,
+    allow_shutdown_methods: bool,
     max_query_len: usize,
     peers: Arc<RwLock<Vec<rmcp::Peer<rmcp::RoleServer>>>>,
     forwarder_started: Arc<AtomicBool>,
@@ -130,6 +131,7 @@ where
             state,
             bus,
             shutdown: None,
+            allow_shutdown_methods: false,
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
@@ -142,6 +144,7 @@ where
             state,
             bus,
             shutdown: Some(shutdown),
+            allow_shutdown_methods: false,
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
@@ -159,6 +162,7 @@ where
             state,
             bus,
             shutdown: Some(shutdown),
+            allow_shutdown_methods: false,
             max_query_len: max_query_len.max(1),
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
@@ -221,6 +225,23 @@ where
         ))
     }
 
+    pub fn streamable_http_service_with_shutdown_and_limits_and_shutdown_methods(
+        state: S,
+        bus: B,
+        shutdown: broadcast::Sender<()>,
+        max_query_len: usize,
+        allow_shutdown_methods: bool,
+    ) -> Result<RaymonMcpService<S, B>, McpInitError> {
+        let handler = RaymonMcp::new_with_shutdown_and_limits(state, bus, shutdown, max_query_len)
+            .with_shutdown_methods(allow_shutdown_methods);
+        handler.start_event_forwarder()?;
+        Ok(StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Default::default(),
+            StreamableHttpServerConfig::default(),
+        ))
+    }
+
     pub fn streamable_http_service_with_config(
         state: S,
         bus: B,
@@ -236,6 +257,11 @@ where
         prune_closed_peers(&mut peers);
         peers.push(peer);
         enforce_peer_cap(&mut peers, MAX_MCP_PEERS);
+    }
+
+    pub fn with_shutdown_methods(mut self, allow_shutdown_methods: bool) -> Self {
+        self.allow_shutdown_methods = allow_shutdown_methods;
+        self
     }
 
     fn map_filters(params: &ListEntriesParams) -> Filters {
@@ -266,13 +292,18 @@ where
         McpError::internal_error(format!("state store error: {error}"), None)
     }
 
-    fn maybe_quit(&self, method: &str) {
-        if !matches!(method, "ray/quit" | "ray/exit" | "raymon/quit" | "raymon/exit") {
-            return;
+    fn is_shutdown_method(method: &str) -> bool {
+        matches!(method, "ray/quit" | "ray/exit" | "raymon/quit" | "raymon/exit")
+    }
+
+    fn maybe_quit(&self, method: &str) -> bool {
+        if !Self::is_shutdown_method(method) || !self.allow_shutdown_methods {
+            return false;
         }
         if let Some(shutdown) = &self.shutdown {
             let _ = shutdown.send(());
         }
+        true
     }
 }
 
@@ -407,6 +438,9 @@ where
     ) -> impl Future<Output = Result<CustomResult, McpError>> + Send + '_ {
         let method = request.method;
         async move {
+            if RaymonMcp::<S, B>::is_shutdown_method(&method) && !self.allow_shutdown_methods {
+                return Err(McpError::invalid_request("mcp shutdown methods are disabled", None));
+            }
             self.maybe_quit(&method);
             Ok(CustomResult::new(json!({ "ok": true })))
         }
@@ -722,6 +756,37 @@ mod tests {
         let mut peers = vec![1, 2, 3, 4];
         enforce_peer_cap(&mut peers, 2);
         assert_eq!(peers, vec![3, 4]);
+    }
+
+    #[test]
+    fn shutdown_methods_are_disabled_by_default() {
+        let store = TestStore {
+            entries: Vec::new(),
+            screens: Vec::new(),
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let handler = RaymonMcp::new_with_shutdown(store, bus, shutdown_tx);
+
+        assert!(!handler.maybe_quit("ray/quit"));
+        assert!(shutdown_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_methods_require_explicit_enablement() {
+        let store = TestStore {
+            entries: Vec::new(),
+            screens: Vec::new(),
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let handler =
+            RaymonMcp::new_with_shutdown(store, bus, shutdown_tx).with_shutdown_methods(true);
+
+        assert!(handler.maybe_quit("raymon/exit"));
+        assert!(shutdown_rx.try_recv().is_ok());
     }
 
     #[derive(Clone)]

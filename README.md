@@ -261,6 +261,7 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_JQ_TIMEOUT_MS` | `10000` | `jq` timeout in milliseconds. |
 | `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
 | `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow binding to non-loopback addresses without auth (NOT recommended). |
+| `RAYMON_ALLOW_MCP_SHUTDOWN` | `false` | Allow custom MCP `ray/quit`, `ray/exit`, `raymon/quit`, and `raymon/exit` methods to stop Raymon. |
 | `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests. |
 | `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
 
