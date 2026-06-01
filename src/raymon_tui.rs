@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
@@ -2921,7 +2922,7 @@ impl Tui {
 
     fn open_origin_in_ide(&mut self) -> Result<(), TuiError> {
         let entry = self.selected_entry().ok_or(TuiError::NoSelection)?;
-        let origin = entry.origin.as_deref().ok_or(TuiError::MissingIde)?;
+        let origin = ide_origin_arg(entry)?;
         let command = self
             .config
             .ide_command
@@ -2930,7 +2931,7 @@ impl Tui {
             .or_else(|| Some("code".to_string()))
             .ok_or(TuiError::MissingIde)?;
 
-        launch_command(&command, origin)?;
+        launch_command(&command, origin.as_os_str())?;
         Ok(())
     }
 
@@ -4654,13 +4655,85 @@ fn logs_view_offset(selected: usize, total: usize, viewport_height: usize) -> us
     offset
 }
 
-fn launch_command(command: &str, arg: impl AsRef<Path>) -> Result<(), TuiError> {
+fn ide_origin_arg(entry: &LogEntry) -> Result<OsString, TuiError> {
+    let (file, line) = origin_file_and_line(entry)?;
+    let canonical = validated_origin_file(file)?;
+    let mut arg = canonical.into_os_string();
+    if let Some(line) = line {
+        arg.push(format!(":{line}"));
+    }
+    Ok(arg)
+}
+
+fn origin_file_and_line(entry: &LogEntry) -> Result<(&str, Option<u32>), TuiError> {
+    if let Some(file) = entry.origin_file.as_deref() {
+        return Ok((file, entry.origin_line));
+    }
+
+    let origin = entry.origin.as_deref().ok_or(TuiError::MissingIde)?;
+    if let Some((file, line)) = origin.rsplit_once(':') {
+        if let Ok(line) = line.parse::<u32>() {
+            return Ok((file, Some(line)));
+        }
+    }
+
+    Ok((origin, None))
+}
+
+fn validated_origin_file(file: &str) -> Result<PathBuf, TuiError> {
+    if file.trim().is_empty() {
+        return Err(invalid_origin_file("empty origin file"));
+    }
+    if file.chars().any(char::is_control) {
+        return Err(invalid_origin_file("origin file contains control characters"));
+    }
+    if looks_like_uri(file) {
+        return Err(invalid_origin_file("refusing URI-like origin file"));
+    }
+
+    let canonical = Path::new(file)
+        .canonicalize()
+        .map_err(|err| invalid_origin_file(format!("invalid origin file: {err}")))?;
+    if !canonical
+        .metadata()
+        .map_err(|err| invalid_origin_file(format!("invalid origin file: {err}")))?
+        .is_file()
+    {
+        return Err(invalid_origin_file("origin file is not a regular file"));
+    }
+    Ok(canonical)
+}
+
+fn invalid_origin_file(reason: impl Into<String>) -> TuiError {
+    TuiError::InvalidCommandLine(reason.into())
+}
+
+fn looks_like_uri(value: &str) -> bool {
+    let Some(colon) = value.find(':') else {
+        return false;
+    };
+    if value[..colon].contains(['/', '\\']) {
+        return false;
+    }
+
+    #[cfg(windows)]
+    if colon == 1 && value.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+
+    let scheme = &value[..colon];
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn launch_command(command: &str, arg: impl AsRef<OsStr>) -> Result<(), TuiError> {
     let parts =
         shlex::split(command).ok_or_else(|| TuiError::InvalidCommandLine(command.into()))?;
     let (program, args) =
         parts.split_first().ok_or_else(|| TuiError::InvalidCommandLine(command.into()))?;
     let arg = arg.as_ref();
-    let arg_lossy = arg.as_os_str().to_string_lossy();
+    let arg_lossy = arg.to_string_lossy();
     if arg_lossy.starts_with('-') {
         return Err(TuiError::InvalidCommandLine(
             "refusing to pass argument starting with '-'".to_string(),
@@ -4872,6 +4945,90 @@ mod tests {
             color: Some("red".to_string()),
             screen: Some("secondary".to_string()),
         });
+    }
+
+    fn log_entry_with_origin(
+        origin: Option<String>,
+        origin_file: Option<String>,
+        origin_line: Option<u32>,
+    ) -> LogEntry {
+        LogEntry {
+            id: 1,
+            uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+            message: "alpha".to_string(),
+            detail: "{}".to_string(),
+            origin,
+            origin_file,
+            origin_line,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: None,
+            screen: Some("main".to_string()),
+        }
+    }
+
+    #[test]
+    fn ide_origin_arg_uses_canonical_origin_file_and_line() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("app.rs");
+        fs::write(&file, "fn main() {}\n").expect("write file");
+        let entry = log_entry_with_origin(
+            Some("vscode://malicious".to_string()),
+            Some(file.to_string_lossy().to_string()),
+            Some(42),
+        );
+        let mut expected = file.canonicalize().expect("canonicalize").into_os_string();
+        expected.push(":42");
+
+        assert_eq!(ide_origin_arg(&entry).expect("ide origin"), expected);
+    }
+
+    #[test]
+    fn ide_origin_arg_supports_legacy_combined_origin_after_validation() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("legacy.rs");
+        fs::write(&file, "fn main() {}\n").expect("write file");
+        let entry =
+            log_entry_with_origin(Some(format!("{}:7", file.to_string_lossy())), None, None);
+        let mut expected = file.canonicalize().expect("canonicalize").into_os_string();
+        expected.push(":7");
+
+        assert_eq!(ide_origin_arg(&entry).expect("ide origin"), expected);
+    }
+
+    #[test]
+    fn ide_origin_arg_rejects_uri_like_origin_file() {
+        let entry =
+            log_entry_with_origin(None, Some("vscode://file/tmp/app.rs".to_string()), Some(12));
+
+        let err = ide_origin_arg(&entry).expect_err("reject URI origin");
+        assert!(
+            matches!(err, TuiError::InvalidCommandLine(message) if message.contains("URI-like"))
+        );
+    }
+
+    #[test]
+    fn ide_origin_arg_rejects_control_bytes_in_origin_file() {
+        let entry =
+            log_entry_with_origin(None, Some(format!("src/main.rs{}[2J", '\u{1b}')), Some(12));
+
+        let err = ide_origin_arg(&entry).expect_err("reject control bytes");
+        assert!(
+            matches!(err, TuiError::InvalidCommandLine(message) if message.contains("control"))
+        );
+    }
+
+    #[test]
+    fn ide_origin_arg_requires_existing_regular_file() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.rs");
+        let entry =
+            log_entry_with_origin(None, Some(missing.to_string_lossy().to_string()), Some(12));
+
+        let err = ide_origin_arg(&entry).expect_err("reject missing file");
+        assert!(
+            matches!(err, TuiError::InvalidCommandLine(message) if message.contains("invalid origin file"))
+        );
     }
 
     #[test]
