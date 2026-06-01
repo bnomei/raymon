@@ -170,6 +170,7 @@ Tools and their input/output shapes:
   Fallback (legacy/single): `{ "uuid": "string" }`.
   String values also accept comma-separated UUIDs: `{ "uuids": "id-1,id-2" }`.
   In comma-separated string form, whitespace in each UUID token is ignored.
+  Requests are limited to 100 UUIDs, 265 bytes per UUID, and a 1 MiB serialized MCP tool result.
 
   Result:
   ```json

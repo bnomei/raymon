@@ -34,6 +34,9 @@ pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSe
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
 const MAX_SEARCH_SCAN_ENTRIES: usize = 5_000;
+const MAX_GET_ENTRIES_UUIDS: usize = 100;
+const MAX_GET_ENTRIES_UUID_BYTES: usize = 265;
+const MAX_GET_ENTRIES_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_QUERY_LEN: usize = 265;
 const MAX_MCP_PEERS: usize = 64;
 
@@ -335,19 +338,24 @@ where
         &self,
         Parameters(params): Parameters<GetEntriesParams>,
     ) -> Result<Json<GetEntriesResult>, McpError> {
-        let uuids = params.uuids.into_vec();
-        if uuids.is_empty() {
-            return Err(McpError::invalid_params("uuids must not be empty".to_string(), None));
-        }
+        let uuids = normalize_get_entry_uuids(params.uuids)?;
 
         let mut entries = Vec::new();
         for uuid in uuids {
-            if uuid.is_empty() {
-                return Err(McpError::invalid_params("uuid must not be empty".to_string(), None));
-            }
             let entry = self.state.get_entry(&uuid).map_err(Self::state_error)?;
             if let Some(entry) = entry {
                 entries.push(McpEntry::from(entry));
+                let result = GetEntriesResult { entries: entries.clone() };
+                let response_bytes = get_entries_tool_result_bytes(&result)?;
+                if response_bytes > MAX_GET_ENTRIES_RESPONSE_BYTES {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "get_entries response too large ({} bytes > max {})",
+                            response_bytes, MAX_GET_ENTRIES_RESPONSE_BYTES
+                        ),
+                        None,
+                    ));
+                }
             }
         }
 
@@ -467,6 +475,53 @@ fn compact_uuid_segment(uuid: &str) -> String {
     uuid.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
+fn normalize_get_entry_uuids(selector: UuidSelector) -> Result<Vec<String>, McpError> {
+    let uuids = selector.into_vec();
+    if uuids.is_empty() {
+        return Err(McpError::invalid_params("uuids must not be empty".to_string(), None));
+    }
+    if uuids.len() > MAX_GET_ENTRIES_UUIDS {
+        return Err(McpError::invalid_params(
+            format!("too many uuids ({} > max {})", uuids.len(), MAX_GET_ENTRIES_UUIDS),
+            None,
+        ));
+    }
+
+    let mut normalized = Vec::with_capacity(uuids.len());
+    for uuid in uuids {
+        let uuid = uuid.trim().to_string();
+        if uuid.is_empty() {
+            return Err(McpError::invalid_params("uuid must not be empty".to_string(), None));
+        }
+        if uuid.len() > MAX_GET_ENTRIES_UUID_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "uuid too long ({} bytes > max {})",
+                    uuid.len(),
+                    MAX_GET_ENTRIES_UUID_BYTES
+                ),
+                None,
+            ));
+        }
+        normalized.push(uuid);
+    }
+
+    Ok(normalized)
+}
+
+fn get_entries_tool_result_bytes(result: &GetEntriesResult) -> Result<usize, McpError> {
+    let value = serde_json::to_value(result).map_err(|error| {
+        McpError::internal_error(format!("failed to serialize get_entries result: {error}"), None)
+    })?;
+    let tool_result = rmcp::model::CallToolResult::structured(value);
+    serde_json::to_vec(&tool_result).map(|bytes| bytes.len()).map_err(|error| {
+        McpError::internal_error(
+            format!("failed to serialize get_entries tool result: {error}"),
+            None,
+        )
+    })
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetEntriesParams {
     #[serde(alias = "uuid")]
@@ -482,7 +537,7 @@ pub struct ListEntriesResult {
     scan_limit: usize,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GetEntriesResult {
     entries: Vec<McpEntry>,
 }
@@ -518,7 +573,7 @@ impl From<crate::raymon_core::Entry> for EntrySummary {
     }
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct McpEntry {
     uuid: String,
     received_at: u64,
@@ -529,14 +584,14 @@ pub struct McpEntry {
     payloads: Vec<McpPayload>,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct McpPayload {
     r#type: String,
     content: Value,
     origin: McpOrigin,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct McpOrigin {
     project: String,
     host: String,
@@ -900,6 +955,74 @@ mod tests {
         let uuids = result.0.entries.into_iter().map(|entry| entry.uuid).collect::<Vec<_>>();
 
         assert_eq!(uuids, vec!["entry-1", "entry-3"]);
+    }
+
+    #[tokio::test]
+    async fn get_entries_rejects_too_many_uuids() {
+        let store = TestStore {
+            entries: Vec::new(),
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(
+                (0..=MAX_GET_ENTRIES_UUIDS).map(|idx| format!("entry-{idx}")).collect(),
+            ),
+        };
+
+        let error = match handler.get_entries(Parameters(params)).await {
+            Ok(_) => panic!("expected invalid params error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn get_entries_rejects_oversized_uuid() {
+        let store = TestStore {
+            entries: Vec::new(),
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(vec!["x".repeat(MAX_GET_ENTRIES_UUID_BYTES + 1)]),
+        };
+
+        let error = match handler.get_entries(Parameters(params)).await {
+            Ok(_) => panic!("expected invalid params error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn get_entries_rejects_oversized_response() {
+        let mut entry = sample_entry("entry-large");
+        entry.payloads[0].content = json!({
+            "message": "x".repeat(MAX_GET_ENTRIES_RESPONSE_BYTES)
+        });
+        let store = TestStore {
+            entries: vec![entry],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+        let params =
+            GetEntriesParams { uuids: UuidSelector::Many(vec!["entry-large".to_string()]) };
+
+        let error = match handler.get_entries(Parameters(params)).await {
+            Ok(_) => panic!("expected invalid params error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     }
 
     #[tokio::test]
