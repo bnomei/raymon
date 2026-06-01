@@ -287,6 +287,7 @@ struct AppState {
     core: CoreState,
     storage: StorageHandle,
     bus: CoreBus,
+    max_entry_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -303,8 +304,9 @@ impl AppState {
             IngestState { core: self.core.clone() },
             self.storage.clone(),
             IngestBus { bus: self.bus.clone() },
-            crate::raymon_ingest::now_millis,
+            crate::raymon_ingest::now_millis as fn() -> u64,
         )
+        .with_max_entry_bytes(self.max_entry_bytes)
     }
 }
 
@@ -657,11 +659,20 @@ fn build_state(
     collect_logs: bool,
     max_entries: usize,
     storage_max_entries: usize,
+    max_entry_bytes: usize,
 ) -> Result<(AppState, Vec<LogEntry>), DynError> {
     let storage = RaymonStorage::new_with_retention(storage_root, storage_max_entries)?;
     let core = CoreState::new(max_entries);
     let logs = restore_from_storage(&core, &storage, collect_logs)?;
-    Ok((AppState { core, storage: StorageHandle::new(storage), bus: CoreBus::new() }, logs))
+    Ok((
+        AppState {
+            core,
+            storage: StorageHandle::new(storage),
+            bus: CoreBus::new(),
+            max_entry_bytes,
+        },
+        logs,
+    ))
 }
 
 fn entry_to_storage_input(entry: &CoreEntry) -> Result<EntryInput, String> {
@@ -2181,8 +2192,13 @@ pub async fn run() -> Result<(), DynError> {
     info!(path = %storage_root.display(), "storage root");
 
     // Archives are file-backed per TUI session; start the live stream empty.
-    let (state, initial_logs) =
-        build_state(&storage_root, false, config.max_entries, config.storage_max_entries)?;
+    let (state, initial_logs) = build_state(
+        &storage_root,
+        false,
+        config.max_entries,
+        config.storage_max_entries,
+        config.max_body_bytes,
+    )?;
     let (shutdown_tx, _) = broadcast::channel(4);
     let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -2555,7 +2571,8 @@ mod tests {
         let input = entry_to_storage_input(&entry).expect("storage input");
         storage.append_entry(input).expect("append");
 
-        let (state, logs) = build_state(root, true, 0, 0).expect("build state");
+        let (state, logs) =
+            build_state(root, true, 0, 0, DEFAULT_MAX_BODY_BYTES).expect("build state");
         let restored = state.core.get(&entry.uuid).expect("get entry");
         assert!(restored.is_some());
         assert_eq!(logs.len(), 1);
@@ -2831,7 +2848,8 @@ mod tests {
     #[tokio::test]
     async fn direct_mcp_requests_respect_body_limit() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (state, _) = build_state(temp.path(), false, 0, 0).expect("build state");
+        let (state, _) =
+            build_state(temp.path(), false, 0, 0, DEFAULT_MAX_BODY_BYTES).expect("build state");
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
         let router =
             build_router(state, shutdown_tx, None, 16, DEFAULT_MAX_QUERY_LEN).expect("router");

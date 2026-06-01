@@ -251,7 +251,7 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_JQ` | `jq` | `jq` command used for detail search. |
 | `RAYMON_TUI_PALETTE` | unset | Optional TUI palette override: 18 comma-separated colors `fg,bg,black,red,green,yellow,blue,magenta,cyan,white,bright_black,bright_red,bright_green,bright_yellow,bright_blue,bright_magenta,bright_cyan,bright_white` as `#RRGGBB` (also accepts `rgb:RRRR/GGGG/BBBB`). |
 | `RAYMON_PALETTE` | unset | Alias for `RAYMON_TUI_PALETTE`. |
-| `RAYMON_MAX_BODY_BYTES` | `1048576` | Max size (bytes) for HTTP POST bodies. |
+| `RAYMON_MAX_BODY_BYTES` | `1048576` | Max size (bytes) for HTTP POST bodies and merged stored entries. |
 | `RAYMON_MAX_QUERY_LEN` | `265` | Max length (bytes) for search/command/picker queries. |
 | `RAYMON_MAX_ENTRIES` | `10000` | Max number of entries kept in memory for the core state (MCP + resync). `0` disables eviction. |
 | `RAYMON_STORAGE_MAX_ENTRIES` | `100000` | Max number of entries kept in `data/entries.jsonl`. When exceeded, Raymon rewrites the JSONL file keeping the newest entries. `0` disables retention. |

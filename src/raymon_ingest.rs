@@ -43,6 +43,8 @@ pub enum IngestError {
     Storage(String),
     #[error("event bus error: {0}")]
     EventBus(String),
+    #[error("entry exceeds size limit: {len} bytes > {max} bytes")]
+    EntryTooLarge { len: usize, max: usize },
 }
 
 impl IngestError {
@@ -50,6 +52,7 @@ impl IngestError {
     pub fn status_code(&self) -> u16 {
         match self {
             Self::InvalidJson(_) => 400,
+            Self::EntryTooLarge { .. } => 413,
             Self::InvalidEnvelope(_) | Self::MissingField(_) => 422,
             Self::StateStore(_) | Self::Storage(_) | Self::EventBus(_) => 500,
         }
@@ -124,6 +127,7 @@ pub struct Ingestor<S, T, B, C> {
     storage: T,
     bus: B,
     clock: C,
+    max_entry_bytes: Option<usize>,
 }
 
 impl<S, T, B, C> Ingestor<S, T, B, C>
@@ -137,7 +141,13 @@ where
     ///
     /// `clock` returns a `u64` timestamp in milliseconds since the UNIX epoch.
     pub fn new(state: S, storage: T, bus: B, clock: C) -> Self {
-        Self { state, storage, bus, clock }
+        Self { state, storage, bus, clock, max_entry_bytes: None }
+    }
+
+    /// Cap the serialized size of each stored entry.
+    pub fn with_max_entry_bytes(mut self, max_entry_bytes: usize) -> Self {
+        self.max_entry_bytes = Some(max_entry_bytes);
+        self
     }
 
     /// Handle a raw HTTP request body and return an [`IngestResponse`].
@@ -172,6 +182,7 @@ where
         };
 
         crate::sanitize::sanitize_entry(&mut entry);
+        self.validate_entry_size(&entry)?;
 
         if update {
             self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
@@ -184,6 +195,21 @@ where
         }
 
         Ok(entry)
+    }
+
+    fn validate_entry_size(&self, entry: &Entry) -> Result<(), IngestError> {
+        let Some(max) = self.max_entry_bytes else {
+            return Ok(());
+        };
+
+        let len = serde_json::to_vec(entry)
+            .map_err(|error| IngestError::InvalidEnvelope(error.to_string()))?
+            .len();
+        if len > max {
+            return Err(IngestError::EntryTooLarge { len, max });
+        }
+
+        Ok(())
     }
 }
 
@@ -438,6 +464,36 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::EntryInserted(_)));
         assert!(matches!(events[1], Event::EntryUpdated(_)));
+    }
+
+    #[rstest]
+    fn ingest_duplicate_uuid_rejects_oversized_merged_entry(
+        state: TestState,
+        storage: TestStorage,
+        bus: TestBus,
+        envelope: Value,
+    ) {
+        let first_entry = serde_json::from_value::<RayEnvelope>(envelope.clone())
+            .expect("envelope")
+            .into_entry(42_000);
+        let max_entry_bytes = serde_json::to_vec(&first_entry).expect("serialize").len();
+        let ingestor = ingestor(&state, &storage, &bus).with_max_entry_bytes(max_entry_bytes);
+        let body = serde_json::to_vec(&envelope).unwrap();
+
+        assert_eq!(ingestor.handle(&body).status, 200);
+        assert_eq!(ingestor.handle(&body).status, 413);
+
+        let stored = storage.entries.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].payloads.len(), 1);
+
+        let state_entries = state.entries.lock().unwrap();
+        assert_eq!(state_entries.len(), 1);
+        assert_eq!(state_entries[0].payloads.len(), 1);
+
+        let events = bus.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::EntryInserted(_)));
     }
 
     #[rstest]

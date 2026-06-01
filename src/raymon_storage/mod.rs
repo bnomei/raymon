@@ -274,7 +274,7 @@ impl Storage {
             return Ok(None);
         }
         let slack = retention_slack(max_entries);
-        let total = self.index.len();
+        let total = self.index.record_count();
         if total <= max_entries.saturating_add(slack) {
             return Ok(None);
         }
@@ -492,6 +492,38 @@ mod tests {
 
         let entry = storage.get_entry_by_id("entry-1").expect("get entry");
         assert!(entry.is_none());
+    }
+
+    #[test]
+    fn retention_counts_duplicate_ids_on_append() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut storage = Storage::new_with_retention(dir.path(), 2).expect("storage");
+
+        for idx in 1..=4 {
+            let input = EntryInput {
+                id: "entry-1".to_string(),
+                project: "proj".to_string(),
+                host: "host".to_string(),
+                screen: "home".to_string(),
+                session: "sess-a".to_string(),
+                summary: format!("entry-{idx}"),
+                search_text: format!("entry-{idx}"),
+                types: Vec::new(),
+                colors: Vec::new(),
+                payload: EntryPayload::Text(format!("payload-{idx}")),
+            };
+            storage.append_entry(input).expect("append entry");
+        }
+
+        let entries_path = dir.path().join(DEFAULT_DATA_DIR).join(ENTRIES_FILE);
+        let jsonl = std::fs::read_to_string(entries_path).expect("read entries");
+        assert_eq!(jsonl.lines().count(), 2);
+
+        let listed = storage.list_entries(None);
+        assert_eq!(listed.len(), 1);
+
+        let entry = storage.get_entry_by_id("entry-1").expect("get entry").expect("missing entry");
+        assert_eq!(entry.summary, "entry-4");
     }
 
     #[rstest]

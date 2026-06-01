@@ -24,25 +24,24 @@ pub(crate) struct IndexRecord {
 #[derive(Debug, Default)]
 pub(crate) struct Index {
     order: Vec<SmolStr>,
+    offsets: Vec<(u64, u64)>,
     by_id: HashMap<SmolStr, IndexRecord>,
 }
 
 impl Index {
-    pub(crate) fn len(&self) -> usize {
-        self.order.len()
+    pub(crate) fn record_count(&self) -> usize {
+        self.offsets.len()
     }
 
     pub(crate) fn tail_offsets(&self, keep: usize) -> Vec<(u64, u64)> {
-        let len = self.order.len();
+        let len = self.offsets.len();
         let start = len.saturating_sub(keep);
-        self.order[start..]
-            .iter()
-            .filter_map(|id| self.by_id.get(id).map(|record| (record.meta.offset, record.meta.len)))
-            .collect()
+        self.offsets[start..].to_vec()
     }
 
     pub(crate) fn insert(&mut self, record: IndexRecord) {
         let id = record.meta.id.clone();
+        self.offsets.push((record.meta.offset, record.meta.len));
         if !self.by_id.contains_key(&id) {
             self.order.push(id.clone());
         }
