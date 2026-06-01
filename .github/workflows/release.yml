@@ -71,12 +71,20 @@ jobs:
 
       - name: Package (unix)
         if: runner.os != 'Windows'
-        run: TARGET=${{ matrix.target }} VERSION=${{ steps.version.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/package-release.sh
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BIN_NAME: ${{ env.BIN_NAME }}
+        run: scripts/package-release.sh
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: scripts/package-release.ps1 -Target ${{ matrix.target }} -Version ${{ steps.version.outputs.version }} -BinName ${{ env.BIN_NAME }}
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BIN_NAME: ${{ env.BIN_NAME }}
+        run: scripts/package-release.ps1 -Target $env:TARGET -Version $env:VERSION -BinName $env:BIN_NAME
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
