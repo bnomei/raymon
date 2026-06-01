@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-01
+### Changed
+- upgrade `axum` to 0.8.9, `crossterm` to 0.29.0, `ratatui` to 0.30.0, and `tiktoken-rs` to 0.11.0
+
 ## [0.5.0] - 2026-06-01
 ### Security
 - harden release version validation before creating release artifacts
