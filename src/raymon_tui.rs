@@ -33,6 +33,7 @@ use thiserror::Error;
 use tiktoken_rs::o200k_base_singleton;
 
 use crate::colors::{canonical_color_name, OFFICIAL_COLORS};
+use crate::sanitize::escape_terminal_controls;
 
 /// Key handling modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3081,7 +3082,7 @@ impl Tui {
 
         if let Some(screen) = &self.state.active_screen {
             spans.push(Span::styled(
-                format!("@{screen}"),
+                format!("@{}", escape_terminal_controls(screen, false)),
                 self.base_style().fg(self.ansi_color(Ansi16::Cyan)),
             ));
             spans.push(Span::raw(" "));
@@ -3106,7 +3107,7 @@ impl Tui {
         let types = if self.state.filters.types.is_empty() {
             " ".to_string()
         } else {
-            summarize_set(&self.state.filters.types)
+            escape_terminal_controls(&summarize_set(&self.state.filters.types), false)
         };
         spans.push(Span::raw(format!("[{types}]")));
         spans.push(Span::raw(" "));
@@ -3259,26 +3260,28 @@ impl Tui {
         }
         if self.state.show_labels {
             if let Some(label) = entry.entry_type.as_deref() {
+                let label = escape_terminal_controls(label, false);
                 spans.push(Span::raw(format!("[{}] ", label)));
             }
         }
         if self.state.show_filename {
             if let Some(file) = entry.origin_file.as_deref() {
+                let file = escape_terminal_controls(file, false);
                 let label = if let Some(line) = entry.origin_line {
                     format!("{file}:{line}")
                 } else {
-                    file.to_string()
+                    file
                 };
                 spans.push(Span::raw(format!("{} ", label)));
             }
         }
         if self.state.show_message {
-            spans.push(Span::raw(entry.message.clone()));
+            spans.push(Span::raw(escape_terminal_controls(&entry.message, false)));
         }
         if self.state.show_uuid {
             let prefix = entry.uuid.get(..5).unwrap_or(entry.uuid.as_str());
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(prefix, self.dimmed_style()));
+            spans.push(Span::styled(escape_terminal_controls(prefix, false), self.dimmed_style()));
         }
         Line::from(spans)
     }
@@ -3316,7 +3319,8 @@ impl Tui {
         }
         if let Some(uuid) = uuid {
             title_spans.push(Span::raw(" "));
-            title_spans.push(Span::styled(uuid, self.dimmed_style()));
+            title_spans
+                .push(Span::styled(escape_terminal_controls(&uuid, false), self.dimmed_style()));
         }
         title_spans.push(Span::raw(" "));
         let title = Line::from(title_spans);
@@ -3807,17 +3811,20 @@ impl Tui {
                     if matches!(picker.kind, PickerKind::Colors) {
                         if let Some(color) = self.color_from_name(&item.label) {
                             spans.push(Span::styled(
-                                item.label.clone(),
+                                escape_terminal_controls(&item.label, false),
                                 self.base_style().fg(color),
                             ));
                         } else {
-                            spans.push(Span::raw(item.label.clone()));
+                            spans.push(Span::raw(escape_terminal_controls(&item.label, false)));
                         }
                     } else {
-                        spans.push(Span::raw(item.label.clone()));
+                        spans.push(Span::raw(escape_terminal_controls(&item.label, false)));
                     }
                     if let Some(meta) = &item.meta {
-                        spans.push(Span::styled(format!(" {}", meta), self.dimmed_style()));
+                        spans.push(Span::styled(
+                            format!(" {}", escape_terminal_controls(meta, false)),
+                            self.dimmed_style(),
+                        ));
                     }
                     ListItem::new(Line::from(spans))
                 })
@@ -3923,12 +3930,14 @@ impl Tui {
             &self.state.last_detail_search
         {
             let is_json = serde_json::from_str::<Value>(result).is_ok();
-            return (result.clone(), is_json);
+            let text =
+                if is_json { result.clone() } else { escape_terminal_controls(result, true) };
+            return (text, is_json);
         }
 
         let parsed = match serde_json::from_str::<Value>(&entry.detail) {
             Ok(value) => value,
-            Err(_) => return (entry.detail.clone(), false),
+            Err(_) => return (escape_terminal_controls(&entry.detail, true), false),
         };
 
         let decorated = detail_value_with_decorators(parsed, self.state.show_decorators);
@@ -3943,7 +3952,7 @@ impl Tui {
             };
             (text, true)
         } else {
-            (json_summary(&decorated), false)
+            (escape_terminal_controls(&json_summary(&decorated), false), false)
         }
     }
 
@@ -4819,6 +4828,10 @@ mod tests {
         terminal.draw(|frame| tui.render(frame)).expect("draw");
     }
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
     fn seed_logs(tui: &mut Tui) {
         tui.push_log(LogEntry {
             id: 1,
@@ -4859,6 +4872,74 @@ mod tests {
             color: Some("red".to_string()),
             screen: Some("secondary".to_string()),
         });
+    }
+
+    #[test]
+    fn format_log_line_escapes_terminal_controls() {
+        let (mut tui, _) = make_tui();
+        tui.state.show_labels = true;
+        tui.state.show_filename = true;
+        tui.state.show_message = true;
+        tui.state.show_uuid = true;
+        let entry = LogEntry {
+            id: 1,
+            uuid: format!("id{}xx-0000", '\u{1b}'),
+            message: format!("hello{}[31m{}", '\u{1b}', '\u{7}'),
+            detail: "detail".to_string(),
+            origin: None,
+            origin_file: Some(format!("src/main.rs{}[2J", '\u{1b}')),
+            origin_line: Some(12),
+            timestamp: None,
+            entry_type: Some(format!("log{}[31m", '\u{1b}')),
+            color: None,
+            screen: Some("main".to_string()),
+        };
+
+        let rendered = line_text(&tui.format_log_line(&entry));
+
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(rendered.contains("[log\\x1b[31m]"));
+        assert!(rendered.contains("src/main.rs\\x1b[2J:12"));
+        assert!(rendered.contains("hello\\x1b[31m\\x07"));
+    }
+
+    #[test]
+    fn plain_detail_text_escapes_terminal_controls() {
+        let (mut tui, _) = make_tui();
+        tui.push_log(LogEntry {
+            id: 1,
+            uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+            message: "alpha".to_string(),
+            detail: format!("line 1{}[2J\nline 2{}", '\u{1b}', '\u{7}'),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: None,
+            entry_type: Some("log".to_string()),
+            color: None,
+            screen: Some("main".to_string()),
+        });
+
+        let (text, is_json) = tui.detail_text();
+
+        assert!(!is_json);
+        assert_eq!(text, "line 1\\x1b[2J\nline 2\\x07");
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{7}'));
+    }
+
+    #[test]
+    fn logs_title_escapes_screen_and_type_filters() {
+        let (mut tui, _) = make_tui();
+        tui.state.active_screen = Some(format!("main{}[2J", '\u{1b}'));
+        tui.state.filters.types.insert(format!("log{}[31m", '\u{1b}'));
+
+        let rendered = line_text(&tui.logs_title_line());
+
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("@main\\x1b[2J"));
+        assert!(rendered.contains("[log\\x1b[31m]"));
     }
 
     #[rstest]

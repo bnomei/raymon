@@ -6,6 +6,7 @@
 
 use crate::raymon_core::Entry;
 use serde_json::Value;
+use std::fmt::Write as _;
 
 const BLOB_STRING_LEN_THRESHOLD: usize = 16 * 1024;
 const BLOB_STRING_PLACEHOLDER: &str = "[[raymon:blob redacted]]";
@@ -18,6 +19,32 @@ pub fn sanitize_entry(entry: &mut Entry) {
     for payload in &mut entry.payloads {
         sanitize_value(&mut payload.content);
     }
+}
+
+/// Escape terminal control characters before text reaches ratatui rendering.
+pub fn escape_terminal_controls(input: &str, preserve_newlines: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+
+    for ch in input.chars() {
+        match ch {
+            '\n' if preserve_newlines => out.push('\n'),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{1b}' => out.push_str("\\x1b"),
+            ch if ch.is_control() => {
+                let code = ch as u32;
+                if code <= 0xff {
+                    let _ = write!(out, "\\x{code:02x}");
+                } else {
+                    let _ = write!(out, "\\u{{{code:x}}}");
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out
 }
 
 fn sanitize_value(value: &mut Value) {
@@ -195,7 +222,7 @@ fn decode_html_entities_lossy(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_entry;
+    use super::{escape_terminal_controls, sanitize_entry};
     use crate::raymon_core::{Entry, Origin, Payload, Screen};
     use serde_json::json;
 
@@ -323,5 +350,22 @@ mod tests {
             .expect("sanitized value");
 
         assert_eq!(sanitized, blob);
+    }
+
+    #[test]
+    fn escapes_terminal_controls_with_visible_text() {
+        let escaped = escape_terminal_controls("ok\u{1b}[31m\u{7}\nnext\tline\u{85}", true);
+
+        assert_eq!(escaped, "ok\\x1b[31m\\x07\nnext\\tline\\x85");
+        assert!(!escaped.contains('\u{1b}'));
+        assert!(!escaped.contains('\u{7}'));
+        assert!(!escaped.contains('\u{85}'));
+    }
+
+    #[test]
+    fn escapes_newlines_when_not_preserved() {
+        let escaped = escape_terminal_controls("line 1\nline 2", false);
+
+        assert_eq!(escaped, "line 1\\nline 2");
     }
 }

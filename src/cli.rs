@@ -24,6 +24,7 @@ use crate::raymon_storage::{
     StoredPayload, ENTRIES_FILE,
 };
 use crate::raymon_tui::{Action, LogEntry, Tui, TuiConfig, TuiPalette};
+use crate::sanitize::escape_terminal_controls;
 use axum::{
     body::{Body, Bytes},
     extract::DefaultBodyLimit,
@@ -829,8 +830,8 @@ fn log_id(uuid: &str) -> u64 {
 }
 
 fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
-    let message = entry_list_label(entry);
-    let detail = entry_detail(entry);
+    let message = escape_terminal_controls(&entry_list_label(entry), false);
+    let detail = escape_terminal_controls(&entry_detail(entry), true);
     let (origin_file, origin_line) = entry
         .payloads
         .first()
@@ -844,7 +845,8 @@ fn log_entry_from_core(entry: &CoreEntry) -> LogEntry {
         }
     });
 
-    let entry_type = entry.payloads.first().map(|payload| payload.r#type.clone());
+    let entry_type =
+        entry.payloads.first().map(|payload| escape_terminal_controls(&payload.r#type, false));
     let color = entry.payloads.iter().find_map(|payload| {
         payload
             .content
@@ -2782,6 +2784,37 @@ mod tests {
         let log = log_entry_from_core(&entry);
         assert_eq!(log.message, "hello");
         assert_eq!(log.detail, "hello");
+    }
+
+    #[test]
+    fn log_entry_escapes_terminal_controls_in_message_and_detail() {
+        let entry = core_entry_with_payload(
+            "log",
+            json!({ "message": format!("ok{}[31m{}done", '\u{1b}', '\u{7}') }),
+        );
+        let log = log_entry_from_core(&entry);
+
+        assert_eq!(log.message, "ok\\x1b[31m\\x07done");
+        assert_eq!(log.detail, "ok\\x1b[31m\\x07done");
+        assert!(!log.message.contains('\u{1b}'));
+        assert!(!log.detail.contains('\u{7}'));
+    }
+
+    #[test]
+    fn text_detail_escapes_terminal_controls_but_preserves_newlines() {
+        let entry = core_entry_with_payload(
+            "custom",
+            json!({
+                "content": format!("line 1{}[2J\nline 2", '\u{1b}'),
+                "label": format!("Text{}[31m", '\u{1b}')
+            }),
+        );
+        let log = log_entry_from_core(&entry);
+
+        assert_eq!(log.message, "Text\\x1b[31m");
+        assert_eq!(log.detail, "line 1\\x1b[2J\nline 2");
+        assert!(!log.message.contains('\u{1b}'));
+        assert!(!log.detail.contains('\u{1b}'));
     }
 
     #[test]
