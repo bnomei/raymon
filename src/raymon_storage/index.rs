@@ -401,15 +401,9 @@ fn apply_offset_limit_sequential(
 ) -> Vec<OffsetMeta> {
     let mut matched = Vec::new();
     let mut skipped = 0usize;
-    let mut scanned = 0usize;
     let scan_limit = filters.scan_limit.unwrap_or(usize::MAX);
 
-    for id in order {
-        if scanned >= scan_limit {
-            break;
-        }
-        scanned += 1;
-
+    for id in order.iter().take(scan_limit) {
         let Some(record) = records.get(id) else {
             continue;
         };

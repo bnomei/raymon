@@ -462,15 +462,9 @@ pub mod filters {
         ) -> Vec<&'a Entry> {
             let mut matched = Vec::new();
             let mut skipped = 0usize;
-            let mut scanned = 0usize;
             let scan_limit = self.scan_limit.unwrap_or(usize::MAX);
 
-            for entry in entries {
-                if scanned >= scan_limit {
-                    break;
-                }
-                scanned += 1;
-
+            for entry in entries.into_iter().take(scan_limit) {
                 if !self.matches_entry_with_query(entry, query) {
                     continue;
                 }
@@ -500,15 +494,9 @@ pub mod filters {
             let mut matched = Vec::new();
             let mut skipped = 0usize;
             let mut count = 0usize;
-            let mut scanned = 0usize;
             let scan_limit = self.scan_limit.unwrap_or(usize::MAX);
 
-            for entry in entries {
-                if scanned >= scan_limit {
-                    break;
-                }
-                scanned += 1;
-
+            for entry in entries.into_iter().take(scan_limit) {
                 if !self.matches_entry_with_query(entry, query) {
                     continue;
                 }
