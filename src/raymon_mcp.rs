@@ -33,6 +33,7 @@ pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSe
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
+const MAX_SEARCH_SCAN_ENTRIES: usize = 5_000;
 const DEFAULT_MAX_QUERY_LEN: usize = 265;
 const MAX_MCP_PEERS: usize = 64;
 
@@ -307,10 +308,17 @@ where
         let mut filters = Self::map_filters(&params);
         filters.limit = Some(limit);
         filters.offset = offset;
+        filters.scan_limit = Some(MAX_SEARCH_SCAN_ENTRIES);
         let (entries, count) =
             self.state.list_entries_with_count(&filters).map_err(Self::state_error)?;
         let summaries = entries.into_iter().map(EntrySummary::from).collect::<Vec<_>>();
-        Ok(Json(ListEntriesResult { entries: summaries, count, limit, offset }))
+        Ok(Json(ListEntriesResult {
+            entries: summaries,
+            count,
+            limit,
+            offset,
+            scan_limit: MAX_SEARCH_SCAN_ENTRIES,
+        }))
     }
 
     #[tool(
@@ -471,6 +479,7 @@ pub struct ListEntriesResult {
     count: usize,
     limit: usize,
     offset: usize,
+    scan_limit: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -578,7 +587,7 @@ impl From<crate::raymon_core::Origin> for McpOrigin {
 
 fn normalize_pagination(limit: Option<usize>, offset: Option<usize>) -> (usize, usize) {
     let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
-    let offset = offset.unwrap_or(0);
+    let offset = offset.unwrap_or(0).min(MAX_SEARCH_SCAN_ENTRIES);
     (limit, offset)
 }
 
@@ -787,6 +796,7 @@ mod tests {
         assert_eq!(filters.screen, Some(Screen::new("main")));
         assert_eq!(filters.limit, Some(10));
         assert_eq!(filters.offset, 2);
+        assert_eq!(filters.scan_limit, Some(MAX_SEARCH_SCAN_ENTRIES));
         assert!(bus_handle.emitted().is_empty());
     }
 
@@ -842,6 +852,29 @@ mod tests {
         let first = result.0.entries.first().expect("first entry");
         assert!(first.payload_count > 0);
         assert!(!first.payload_types.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_bounds_count_scan_work() {
+        let total_entries = MAX_SEARCH_SCAN_ENTRIES + 25;
+        let entries =
+            (0..total_entries).map(|idx| sample_entry(&format!("entry-{idx}"))).collect::<Vec<_>>();
+        let store = TestStore {
+            entries,
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store.clone(), bus);
+
+        let result = handler.search(Parameters(ListEntriesParams::default())).await.unwrap();
+
+        assert_eq!(result.0.count, MAX_SEARCH_SCAN_ENTRIES);
+        assert_eq!(result.0.entries.len(), DEFAULT_LIST_LIMIT);
+        assert_eq!(result.0.scan_limit, MAX_SEARCH_SCAN_ENTRIES);
+
+        let filters = store.last_filters.lock().unwrap().clone().expect("filters captured");
+        assert_eq!(filters.scan_limit, Some(MAX_SEARCH_SCAN_ENTRIES));
     }
 
     #[tokio::test]

@@ -136,7 +136,10 @@ impl Index {
         #[cfg(feature = "rayon")]
         {
             const PAR_FILTER_THRESHOLD: usize = 2048;
-            if filters.limit.is_none() && self.order.len() >= PAR_FILTER_THRESHOLD {
+            if filters.scan_limit.is_none()
+                && filters.limit.is_none()
+                && self.order.len() >= PAR_FILTER_THRESHOLD
+            {
                 let matches: Vec<bool> = self
                     .order
                     .par_iter()
@@ -398,8 +401,15 @@ fn apply_offset_limit_sequential(
 ) -> Vec<OffsetMeta> {
     let mut matched = Vec::new();
     let mut skipped = 0usize;
+    let mut scanned = 0usize;
+    let scan_limit = filters.scan_limit.unwrap_or(usize::MAX);
 
     for id in order {
+        if scanned >= scan_limit {
+            break;
+        }
+        scanned += 1;
+
         let Some(record) = records.get(id) else {
             continue;
         };

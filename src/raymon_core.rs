@@ -374,6 +374,8 @@ pub mod filters {
         pub host: Option<String>,
         pub limit: Option<usize>,
         pub offset: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub scan_limit: Option<usize>,
     }
 
     impl Filters {
@@ -410,6 +412,7 @@ pub mod filters {
                 const PAR_FILTER_THRESHOLD: usize = 2048;
 
                 if self.limit.is_some()
+                    || self.scan_limit.is_some()
                     || entries.len() < PAR_FILTER_THRESHOLD
                     || !self.has_payload_filters(query_ref)
                 {
@@ -459,8 +462,15 @@ pub mod filters {
         ) -> Vec<&'a Entry> {
             let mut matched = Vec::new();
             let mut skipped = 0usize;
+            let mut scanned = 0usize;
+            let scan_limit = self.scan_limit.unwrap_or(usize::MAX);
 
             for entry in entries {
+                if scanned >= scan_limit {
+                    break;
+                }
+                scanned += 1;
+
                 if !self.matches_entry_with_query(entry, query) {
                     continue;
                 }
@@ -490,8 +500,15 @@ pub mod filters {
             let mut matched = Vec::new();
             let mut skipped = 0usize;
             let mut count = 0usize;
+            let mut scanned = 0usize;
+            let scan_limit = self.scan_limit.unwrap_or(usize::MAX);
 
             for entry in entries {
+                if scanned >= scan_limit {
+                    break;
+                }
+                scanned += 1;
+
                 if !self.matches_entry_with_query(entry, query) {
                     continue;
                 }
@@ -1017,6 +1034,24 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].uuid, "entry-b");
+    }
+
+    #[rstest]
+    fn apply_with_count_honors_scan_limit(entry_with_payloads: Entry) {
+        let mut entries =
+            [entry_with_payloads.clone(), entry_with_payloads.clone(), entry_with_payloads];
+        entries[0].uuid = "entry-a".to_string();
+        entries[1].uuid = "entry-b".to_string();
+        entries[2].uuid = "entry-c".to_string();
+
+        let filters = Filters { scan_limit: Some(2), ..Default::default() };
+
+        let (page, count) = filters.apply_with_count(entries.iter()).unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].uuid, "entry-a");
+        assert_eq!(page[1].uuid, "entry-b");
     }
 
     #[rstest]

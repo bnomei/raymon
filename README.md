@@ -154,10 +154,12 @@ Tools and their input/output shapes:
     ],
     "count": "number",
     "limit": "number",
-    "offset": "number"
+    "offset": "number",
+    "scan_limit": "number"
   }
   ```
-  `count` is the total number of entries matching the filters (ignores `limit`/`offset`).
+  `count` is the number of entries matching the filters within the bounded scan window
+  (ignores `limit`/`offset`).
 
 - `raymon.get_entries` - fetch entries by UUID(s)
 
