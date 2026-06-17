@@ -23,10 +23,15 @@ use rmcp::{
     },
     ErrorData as McpError, Json, ServerHandler,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::{broadcast, mpsc, RwLock};
+
+mod schema;
+
+pub use schema::{
+    EntrySummary, GetEntriesParams, GetEntriesResult, ListEntriesParams, ListEntriesResult,
+    McpEntry, McpOrigin, McpPayload, StringListSelector, UuidSelector,
+};
 
 /// Streamable HTTP service type for mounting on `/mcp` with axum/tower.
 pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSessionManager>;
@@ -477,68 +482,6 @@ where
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(default)]
-pub struct ListEntriesParams {
-    query: Option<String>,
-    types: StringListSelector,
-    colors: StringListSelector,
-    screen: Option<String>,
-    project: Option<String>,
-    host: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(untagged)]
-pub enum StringListSelector {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Default for StringListSelector {
-    fn default() -> Self {
-        Self::Many(Vec::new())
-    }
-}
-
-impl StringListSelector {
-    fn to_vec(&self) -> Vec<String> {
-        match self {
-            Self::One(value) => comma_separated_values(value),
-            Self::Many(values) => values.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(untagged)]
-pub enum UuidSelector {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl UuidSelector {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            Self::One(uuid) if uuid.contains(',') => {
-                uuid.split(',').map(compact_uuid_segment).collect()
-            }
-            Self::One(uuid) => vec![uuid.trim().to_string()],
-            Self::Many(uuids) => uuids,
-        }
-    }
-}
-
-fn comma_separated_values(value: &str) -> Vec<String> {
-    value.split(',').map(|segment| segment.trim().to_string()).collect()
-}
-
-fn compact_uuid_segment(uuid: &str) -> String {
-    uuid.chars().filter(|ch| !ch.is_whitespace()).collect()
-}
-
 fn normalize_get_entry_uuids(selector: UuidSelector) -> Result<Vec<String>, McpError> {
     let uuids = selector.into_vec();
     if uuids.is_empty() {
@@ -584,143 +527,6 @@ fn get_entries_tool_result_bytes(result: &GetEntriesResult) -> Result<usize, Mcp
             None,
         )
     })
-}
-
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct GetEntriesParams {
-    #[serde(alias = "uuid")]
-    uuids: UuidSelector,
-    #[serde(default, alias = "redacted", alias = "redact_payloads")]
-    redact: bool,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct ListEntriesResult {
-    entries: Vec<EntrySummary>,
-    count: usize,
-    limit: usize,
-    offset: usize,
-    scan_limit: usize,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct GetEntriesResult {
-    entries: Vec<McpEntry>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct EntrySummary {
-    uuid: String,
-    received_at: u64,
-    project: String,
-    host: String,
-    screen: String,
-    payload_count: usize,
-    payload_types: Vec<String>,
-}
-
-impl From<crate::raymon_core::Entry> for EntrySummary {
-    fn from(entry: crate::raymon_core::Entry) -> Self {
-        let mut payload_types = Vec::new();
-        for payload in &entry.payloads {
-            if !payload_types.iter().any(|value| value == &payload.r#type) {
-                payload_types.push(payload.r#type.clone());
-            }
-        }
-        Self {
-            uuid: entry.uuid,
-            received_at: entry.received_at,
-            project: entry.project,
-            host: entry.host,
-            screen: entry.screen.as_str().to_string(),
-            payload_count: entry.payloads.len(),
-            payload_types,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct McpEntry {
-    uuid: String,
-    received_at: u64,
-    project: String,
-    host: String,
-    screen: String,
-    session_id: Option<String>,
-    payloads: Vec<McpPayload>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct McpPayload {
-    r#type: String,
-    content: Value,
-    origin: McpOrigin,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct McpOrigin {
-    project: String,
-    host: String,
-    screen: Option<String>,
-    session_id: Option<String>,
-    function_name: Option<String>,
-    file: Option<String>,
-    line_number: Option<u32>,
-}
-
-impl From<crate::raymon_core::Entry> for McpEntry {
-    fn from(entry: crate::raymon_core::Entry) -> Self {
-        Self::from_entry(entry, false)
-    }
-}
-
-impl McpEntry {
-    fn from_entry(entry: crate::raymon_core::Entry, redact_payloads: bool) -> Self {
-        Self {
-            uuid: entry.uuid,
-            received_at: entry.received_at,
-            project: entry.project,
-            host: entry.host,
-            screen: entry.screen.as_str().to_string(),
-            session_id: entry.session_id.map(|value| value.0),
-            payloads: entry
-                .payloads
-                .into_iter()
-                .map(|payload| McpPayload::from_payload(payload, redact_payloads))
-                .collect(),
-        }
-    }
-}
-
-impl From<crate::raymon_core::Payload> for McpPayload {
-    fn from(payload: crate::raymon_core::Payload) -> Self {
-        Self::from_payload(payload, false)
-    }
-}
-
-impl McpPayload {
-    fn from_payload(payload: crate::raymon_core::Payload, redact_payloads: bool) -> Self {
-        let mut content = payload.content;
-        if redact_payloads {
-            crate::sanitize::redact_sensitive_payload_value(&mut content);
-        }
-
-        Self { r#type: payload.r#type, content, origin: McpOrigin::from(payload.origin) }
-    }
-}
-
-impl From<crate::raymon_core::Origin> for McpOrigin {
-    fn from(origin: crate::raymon_core::Origin) -> Self {
-        Self {
-            project: origin.project,
-            host: origin.host,
-            screen: origin.screen.map(|screen| screen.as_str().to_string()),
-            session_id: origin.session_id.map(|value| value.0),
-            function_name: origin.function_name,
-            file: origin.file,
-            line_number: origin.line_number,
-        }
-    }
 }
 
 fn normalize_pagination(limit: Option<usize>, offset: Option<usize>) -> (usize, usize) {
@@ -780,7 +586,7 @@ mod tests {
     use crate::raymon_core::{types::default_screen_name, Entry, Origin, Payload};
     use rmcp::handler::server::common::schema_for_type;
     use rmcp::model::{ErrorCode, Tool};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::Mutex;
 
     #[derive(Clone, Debug)]
