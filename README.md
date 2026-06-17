@@ -1,8 +1,8 @@
 # raymon
 
 [![Crates.io Version](https://img.shields.io/crates/v/raymon)](https://crates.io/crates/raymon)
-[![CI](https://img.shields.io/github/actions/workflow/status/bnomei/tmux-mcp/ci.yml?branch=main)](https://github.com/bnomei/tmux-mcp/actions/workflows/ci.yml)
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json&style=flat)](https://codspeed.io/bnomei/raymon?utm_source=badge)
+[![CI](https://img.shields.io/github/actions/workflow/status/bnomei/raymon/ci.yml?branch=main&label=CI)](https://github.com/bnomei/raymon/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/bnomei/raymon/badge.json&style=flat)](https://codspeed.io/bnomei/raymon?utm_source=badge)
 [![Crates.io Downloads](https://img.shields.io/crates/d/raymon)](https://crates.io/crates/raymon)
 [![License](https://img.shields.io/crates/l/raymon)](https://crates.io/crates/raymon)
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
@@ -103,7 +103,10 @@ codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON
 {
   "mcpServers": {
     "raymon": {
-      "url": "http://<host>:23517/mcp"
+      "url": "http://<host>:23517/mcp",
+      "headers": {
+        "Authorization": "Bearer ${RAYMON_AUTH_TOKEN}"
+      }
     }
   }
 }
@@ -111,12 +114,13 @@ codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON
 
 ## HTTP Endpoints
 
-- `POST /`: Ray ingest endpoint (Ray payload envelope). Raymon also keeps a compatibility
-  fallback enabled by default here: when ingest parsing rejects the body and the JSON body looks
-  like MCP JSON-RPC (`{"jsonrpc":"2.0","method":...}` or a batch containing one), Raymon forwards
-  the request to the MCP handler instead of returning an ingest error. Valid Ray ingest envelopes
-  are still ingested normally.
-- `POST /mcp`: MCP Streamable HTTP endpoint.
+- `POST /`: Ray ingest endpoint for Ray payload envelopes.
+  - Also keeps a compatibility fallback enabled by default for MCP clients that post JSON-RPC
+    requests to the root path: when ingest parsing rejects the body and the JSON body looks like
+    MCP JSON-RPC (`{"jsonrpc":"2.0","method":...}` or a batch containing one), Raymon forwards the
+    request to the MCP service instead of returning an ingest error. Valid Ray ingest envelopes are
+    still ingested normally.
+- `POST /mcp`: Normal MCP Streamable HTTP endpoint. Prefer this route for MCP clients.
 
 ## MCP Tools
 
@@ -265,7 +269,7 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
 | `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow binding to non-loopback addresses without auth (NOT recommended). |
 | `RAYMON_ALLOW_MCP_SHUTDOWN` | `false` | Allow custom MCP `ray/quit`, `ray/exit`, `raymon/quit`, and `raymon/exit` methods to stop Raymon. |
-| `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests. |
+| `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests, including both `POST /` and `POST /mcp`. |
 | `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
 
 Raymon also supports a `ray.json` config file (searched from the current directory upwards). Keys mirror env vars (e.g. `host`, `port`, `tui`, `max_entries`, `storage_max_entries`). CLI flags override env and file config.
