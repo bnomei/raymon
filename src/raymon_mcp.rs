@@ -8,6 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::{io, str};
 
 use crate::raymon_core::{Event, EventBus, Filters, Screen, StateStore};
 use rmcp::{
@@ -339,6 +340,36 @@ where
         }
         true
     }
+
+    fn get_entries_inner(
+        &self,
+        params: GetEntriesParams,
+    ) -> Result<Json<GetEntriesResult>, McpError> {
+        let uuids = normalize_get_entry_uuids(params.uuids)?;
+        let redact_payloads = self.redact_payloads || params.redact;
+
+        let mut entries = Vec::with_capacity(uuids.len());
+        let mut sizer = GetEntriesResponseSizer::default();
+        for uuid in uuids {
+            let entry = self.state.get_entry(&uuid).map_err(Self::state_error)?;
+            if let Some(entry) = entry {
+                let entry = McpEntry::from_entry(entry, redact_payloads);
+                let response_bytes = sizer.push_entry(&entry)?;
+                if response_bytes > MAX_GET_ENTRIES_RESPONSE_BYTES {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "get_entries response too large ({} bytes > max {})",
+                            response_bytes, MAX_GET_ENTRIES_RESPONSE_BYTES
+                        ),
+                        None,
+                    ));
+                }
+                entries.push(entry);
+            }
+        }
+
+        Ok(Json(GetEntriesResult { entries }))
+    }
 }
 
 #[tool_router]
@@ -403,29 +434,7 @@ where
         &self,
         Parameters(params): Parameters<GetEntriesParams>,
     ) -> Result<Json<GetEntriesResult>, McpError> {
-        let uuids = normalize_get_entry_uuids(params.uuids)?;
-        let redact_payloads = self.redact_payloads || params.redact;
-
-        let mut entries = Vec::new();
-        for uuid in uuids {
-            let entry = self.state.get_entry(&uuid).map_err(Self::state_error)?;
-            if let Some(entry) = entry {
-                entries.push(McpEntry::from_entry(entry, redact_payloads));
-                let result = GetEntriesResult { entries: entries.clone() };
-                let response_bytes = get_entries_tool_result_bytes(&result)?;
-                if response_bytes > MAX_GET_ENTRIES_RESPONSE_BYTES {
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "get_entries response too large ({} bytes > max {})",
-                            response_bytes, MAX_GET_ENTRIES_RESPONSE_BYTES
-                        ),
-                        None,
-                    ));
-                }
-            }
-        }
-
-        Ok(Json(GetEntriesResult { entries }))
+        self.get_entries_inner(params)
     }
 }
 
@@ -516,6 +525,7 @@ fn normalize_get_entry_uuids(selector: UuidSelector) -> Result<Vec<String>, McpE
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn get_entries_tool_result_bytes(result: &GetEntriesResult) -> Result<usize, McpError> {
     let value = serde_json::to_value(result).map_err(|error| {
         McpError::internal_error(format!("failed to serialize get_entries result: {error}"), None)
@@ -527,6 +537,91 @@ fn get_entries_tool_result_bytes(result: &GetEntriesResult) -> Result<usize, Mcp
             None,
         )
     })
+}
+
+#[derive(Default)]
+struct GetEntriesResponseSizer {
+    entries: usize,
+    structured_entries_bytes: usize,
+    content_text_entries_bytes: usize,
+}
+
+impl GetEntriesResponseSizer {
+    fn push_entry(&mut self, entry: &McpEntry) -> Result<usize, McpError> {
+        let entry_json = serde_json::to_vec(entry).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to serialize get_entries entry: {error}"),
+                None,
+            )
+        })?;
+        let entry_json_text = str::from_utf8(&entry_json).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to read serialized get_entries entry as utf-8: {error}"),
+                None,
+            )
+        })?;
+        let entry_content_text_bytes = escaped_json_string_inner_len(entry_json_text)?;
+        let separator = usize::from(self.entries > 0);
+
+        self.entries += 1;
+        self.structured_entries_bytes += separator + entry_json.len();
+        self.content_text_entries_bytes += separator + entry_content_text_bytes;
+
+        Ok(self.tool_result_bytes())
+    }
+
+    fn tool_result_bytes(&self) -> usize {
+        const STRUCTURED_PREFIX: &str = r#"{"entries":["#;
+        const STRUCTURED_SUFFIX: &str = r#"]}"#;
+        const CONTENT_PREFIX: &str = r#"{"content":[{"type":"text","text":"#;
+        const CONTENT_TO_STRUCTURED: &str = r#"}],"structuredContent":"#;
+        const TOOL_SUFFIX: &str = r#","isError":false}"#;
+
+        let structured_result_bytes =
+            STRUCTURED_PREFIX.len() + self.structured_entries_bytes + STRUCTURED_SUFFIX.len();
+        let content_text_inner_bytes = escaped_json_string_inner_len_static(STRUCTURED_PREFIX)
+            + self.content_text_entries_bytes
+            + escaped_json_string_inner_len_static(STRUCTURED_SUFFIX);
+        let content_text_bytes = 2 + content_text_inner_bytes;
+
+        CONTENT_PREFIX.len()
+            + content_text_bytes
+            + CONTENT_TO_STRUCTURED.len()
+            + structured_result_bytes
+            + TOOL_SUFFIX.len()
+    }
+}
+
+fn escaped_json_string_inner_len(value: &str) -> Result<usize, McpError> {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value).map_err(|error| {
+        McpError::internal_error(
+            format!("failed to serialize get_entries text content: {error}"),
+            None,
+        )
+    })?;
+    Ok(writer.bytes.saturating_sub(2))
+}
+
+fn escaped_json_string_inner_len_static(value: &'static str) -> usize {
+    escaped_json_string_inner_len(value)
+        .expect("static get_entries JSON fragments should serialize")
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn normalize_pagination(limit: Option<usize>, offset: Option<usize>) -> (usize, usize) {
@@ -587,7 +682,10 @@ mod tests {
     use rmcp::handler::server::common::schema_for_type;
     use rmcp::model::{ErrorCode, Tool};
     use serde_json::{json, Value};
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Mutex,
+    };
 
     #[derive(Clone, Debug)]
     struct MockPeer {
@@ -1084,6 +1182,93 @@ mod tests {
         };
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn get_entries_incremental_sizer_matches_tool_result_bytes() {
+        let mut sizer = GetEntriesResponseSizer::default();
+        let mut entries = Vec::new();
+
+        for idx in 0..MAX_GET_ENTRIES_UUIDS {
+            let mut entry = sample_entry(&format!("entry-{idx}"));
+            entry.payloads[0].content = json!({
+                "message": format!("quoted \" slash \\ newline\n snowman \u{2603} {idx}")
+            });
+            let entry = McpEntry::from_entry(entry, false);
+            let counted = sizer.push_entry(&entry).expect("entry should size");
+            entries.push(entry);
+
+            if matches!(idx, 0 | 1) || idx + 1 == MAX_GET_ENTRIES_UUIDS {
+                let expected =
+                    get_entries_tool_result_bytes(&GetEntriesResult { entries: entries.clone() })
+                        .expect("tool result should size");
+                assert_eq!(counted, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_entries_stops_fetching_after_response_cap() {
+        #[derive(Clone)]
+        struct RepeatingLargeEntryStore {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl StateStore for RepeatingLargeEntryStore {
+            type Error = TestError;
+
+            fn insert_entry(&mut self, _entry: Entry) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn update_entry(&mut self, _entry: Entry) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, Self::Error> {
+                self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+                let mut entry = sample_entry(uuid);
+                entry.payloads[0].content = json!({
+                    "message": "x".repeat(MAX_GET_ENTRIES_RESPONSE_BYTES / 8)
+                });
+                Ok(Some(entry))
+            }
+
+            fn list_entries(&self, _filters: &Filters) -> Result<Vec<Entry>, Self::Error> {
+                Ok(Vec::new())
+            }
+
+            fn list_screens(&self) -> Result<Vec<Screen>, Self::Error> {
+                Ok(Vec::new())
+            }
+
+            fn clear_screen(&mut self, _screen: &Screen) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn clear_all(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = RepeatingLargeEntryStore { calls: calls.clone() };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(
+                (0..MAX_GET_ENTRIES_UUIDS).map(|idx| format!("entry-{idx}")).collect(),
+            ),
+            redact: false,
+        };
+
+        let error = match handler.get_entries(Parameters(params)).await {
+            Ok(_) => panic!("expected invalid params error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert!(calls.load(AtomicOrdering::Relaxed) < MAX_GET_ENTRIES_UUIDS);
     }
 
     #[tokio::test]
