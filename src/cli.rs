@@ -2921,4 +2921,108 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    fn test_router(auth_token: Option<String>, max_body_bytes: usize) -> Router {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, _) =
+            build_state(temp.path(), false, 0, 0, DEFAULT_MAX_BODY_BYTES).expect("build state");
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+        build_router(state, shutdown_tx, auth_token, max_body_bytes, DEFAULT_MAX_QUERY_LEN, false)
+            .expect("router")
+    }
+
+    async fn post_json(router: Router, uri: &str, body: serde_json::Value) -> Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    #[tokio::test]
+    async fn root_accepts_json_rpc_mcp_fallback_by_default() {
+        let router = test_router(None, DEFAULT_MAX_BODY_BYTES);
+        let response = post_json(
+            router,
+            "/",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }),
+        )
+        .await;
+
+        assert_ne!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn root_non_json_rpc_body_uses_ingest_error() {
+        let router = test_router(None, DEFAULT_MAX_BODY_BYTES);
+        let response = post_json(
+            router,
+            "/",
+            json!({
+                "jsonrpc": "1.0",
+                "id": 1,
+                "method": "tools/list"
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn root_fallback_and_direct_mcp_require_auth() {
+        let mcp_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        let root_response = post_json(
+            test_router(Some("secret".to_string()), DEFAULT_MAX_BODY_BYTES),
+            "/",
+            mcp_body.clone(),
+        )
+        .await;
+        let mcp_response = post_json(
+            test_router(Some("secret".to_string()), DEFAULT_MAX_BODY_BYTES),
+            "/mcp",
+            mcp_body,
+        )
+        .await;
+
+        assert_eq!(root_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(mcp_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn root_fallback_respects_body_limit() {
+        let router = test_router(None, 16);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(axum::http::header::CONTENT_LENGTH, "17")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("x".repeat(17)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
