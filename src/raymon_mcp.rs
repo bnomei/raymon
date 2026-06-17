@@ -112,6 +112,7 @@ pub struct RaymonMcp<S, B> {
     bus: B,
     shutdown: Option<broadcast::Sender<()>>,
     allow_shutdown_methods: bool,
+    redact_payloads: bool,
     max_query_len: usize,
     peers: Arc<RwLock<Vec<rmcp::Peer<rmcp::RoleServer>>>>,
     forwarder_started: Arc<AtomicBool>,
@@ -132,6 +133,7 @@ where
             bus,
             shutdown: None,
             allow_shutdown_methods: false,
+            redact_payloads: false,
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
@@ -145,6 +147,7 @@ where
             bus,
             shutdown: Some(shutdown),
             allow_shutdown_methods: false,
+            redact_payloads: false,
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
@@ -163,6 +166,7 @@ where
             bus,
             shutdown: Some(shutdown),
             allow_shutdown_methods: false,
+            redact_payloads: false,
             max_query_len: max_query_len.max(1),
             peers: Arc::new(RwLock::new(Vec::new())),
             forwarder_started: Arc::new(AtomicBool::new(false)),
@@ -177,11 +181,12 @@ where
         let mut subscription =
             self.bus.subscribe().map_err(|err| McpInitError::EventBus(err.to_string()))?;
         let peers = self.peers.clone();
+        let redact_payloads = self.redact_payloads;
         let handle = tokio::runtime::Handle::try_current().map_err(|_| McpInitError::NoRuntime)?;
 
         handle.spawn(async move {
             while let Some(event) = subscription.recv().await {
-                let notification = event_to_notification(event);
+                let notification = event_to_notification(event, redact_payloads);
                 broadcast_notification(&peers, notification).await;
             }
         });
@@ -232,8 +237,27 @@ where
         max_query_len: usize,
         allow_shutdown_methods: bool,
     ) -> Result<RaymonMcpService<S, B>, McpInitError> {
+        Self::streamable_http_service_with_shutdown_and_limits_and_shutdown_methods_and_payload_redaction(
+            state,
+            bus,
+            shutdown,
+            max_query_len,
+            allow_shutdown_methods,
+            false,
+        )
+    }
+
+    pub fn streamable_http_service_with_shutdown_and_limits_and_shutdown_methods_and_payload_redaction(
+        state: S,
+        bus: B,
+        shutdown: broadcast::Sender<()>,
+        max_query_len: usize,
+        allow_shutdown_methods: bool,
+        redact_payloads: bool,
+    ) -> Result<RaymonMcpService<S, B>, McpInitError> {
         let handler = RaymonMcp::new_with_shutdown_and_limits(state, bus, shutdown, max_query_len)
-            .with_shutdown_methods(allow_shutdown_methods);
+            .with_shutdown_methods(allow_shutdown_methods)
+            .with_payload_redaction(redact_payloads);
         handler.start_event_forwarder()?;
         Ok(StreamableHttpService::new(
             move || Ok(handler.clone()),
@@ -261,6 +285,11 @@ where
 
     pub fn with_shutdown_methods(mut self, allow_shutdown_methods: bool) -> Self {
         self.allow_shutdown_methods = allow_shutdown_methods;
+        self
+    }
+
+    pub fn with_payload_redaction(mut self, redact_payloads: bool) -> Self {
+        self.redact_payloads = redact_payloads;
         self
     }
 
@@ -370,12 +399,13 @@ where
         Parameters(params): Parameters<GetEntriesParams>,
     ) -> Result<Json<GetEntriesResult>, McpError> {
         let uuids = normalize_get_entry_uuids(params.uuids)?;
+        let redact_payloads = self.redact_payloads || params.redact;
 
         let mut entries = Vec::new();
         for uuid in uuids {
             let entry = self.state.get_entry(&uuid).map_err(Self::state_error)?;
             if let Some(entry) = entry {
-                entries.push(McpEntry::from(entry));
+                entries.push(McpEntry::from_entry(entry, redact_payloads));
                 let result = GetEntriesResult { entries: entries.clone() };
                 let response_bytes = get_entries_tool_result_bytes(&result)?;
                 if response_bytes > MAX_GET_ENTRIES_RESPONSE_BYTES {
@@ -560,6 +590,8 @@ fn get_entries_tool_result_bytes(result: &GetEntriesResult) -> Result<usize, Mcp
 pub struct GetEntriesParams {
     #[serde(alias = "uuid")]
     uuids: UuidSelector,
+    #[serde(default, alias = "redacted", alias = "redact_payloads")]
+    redact: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -638,6 +670,12 @@ pub struct McpOrigin {
 
 impl From<crate::raymon_core::Entry> for McpEntry {
     fn from(entry: crate::raymon_core::Entry) -> Self {
+        Self::from_entry(entry, false)
+    }
+}
+
+impl McpEntry {
+    fn from_entry(entry: crate::raymon_core::Entry, redact_payloads: bool) -> Self {
         Self {
             uuid: entry.uuid,
             received_at: entry.received_at,
@@ -645,18 +683,29 @@ impl From<crate::raymon_core::Entry> for McpEntry {
             host: entry.host,
             screen: entry.screen.as_str().to_string(),
             session_id: entry.session_id.map(|value| value.0),
-            payloads: entry.payloads.into_iter().map(McpPayload::from).collect(),
+            payloads: entry
+                .payloads
+                .into_iter()
+                .map(|payload| McpPayload::from_payload(payload, redact_payloads))
+                .collect(),
         }
     }
 }
 
 impl From<crate::raymon_core::Payload> for McpPayload {
     fn from(payload: crate::raymon_core::Payload) -> Self {
-        Self {
-            r#type: payload.r#type,
-            content: payload.content,
-            origin: McpOrigin::from(payload.origin),
+        Self::from_payload(payload, false)
+    }
+}
+
+impl McpPayload {
+    fn from_payload(payload: crate::raymon_core::Payload, redact_payloads: bool) -> Self {
+        let mut content = payload.content;
+        if redact_payloads {
+            crate::sanitize::redact_sensitive_payload_value(&mut content);
         }
+
+        Self { r#type: payload.r#type, content, origin: McpOrigin::from(payload.origin) }
     }
 }
 
@@ -680,14 +729,30 @@ fn normalize_pagination(limit: Option<usize>, offset: Option<usize>) -> (usize, 
     (limit, offset)
 }
 
-fn event_to_notification(event: Event) -> ServerNotification {
+fn event_to_notification(event: Event, redact_payloads: bool) -> ServerNotification {
     let payload = match event {
-        Event::EntryInserted(entry) => json!({ "type": "entry_inserted", "entry": entry }),
-        Event::EntryUpdated(entry) => json!({ "type": "entry_updated", "entry": entry }),
+        Event::EntryInserted(entry) => {
+            json!({ "type": "entry_inserted", "entry": redact_event_entry(entry, redact_payloads) })
+        }
+        Event::EntryUpdated(entry) => {
+            json!({ "type": "entry_updated", "entry": redact_event_entry(entry, redact_payloads) })
+        }
         Event::ScreenCleared(screen) => json!({ "type": "screen_cleared", "screen": screen }),
         Event::StateCleared => json!({ "type": "state_cleared" }),
     };
     ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
+}
+
+fn redact_event_entry(
+    mut entry: crate::raymon_core::Entry,
+    redact_payloads: bool,
+) -> crate::raymon_core::Entry {
+    if redact_payloads {
+        for payload in &mut entry.payloads {
+            crate::sanitize::redact_sensitive_payload_value(&mut payload.content);
+        }
+    }
+    entry
 }
 
 async fn broadcast_notification(
@@ -886,6 +951,29 @@ mod tests {
         }
     }
 
+    fn sample_sensitive_entry(uuid: &str) -> Entry {
+        let mut entry = sample_entry(uuid);
+        entry.payloads[0].content = json!({
+            "message": "visible",
+            "password": "secret",
+            "nested": {
+                "api_key": "key",
+                "note": "keep"
+            }
+        });
+        entry
+    }
+
+    fn notification_entry_payload(notification: ServerNotification) -> Value {
+        match notification {
+            ServerNotification::CustomNotification(notification) => {
+                notification.params.expect("custom notification should include params")["entry"]
+                    .clone()
+            }
+            other => panic!("expected custom notification, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn search_maps_filters() {
         let store = TestStore {
@@ -1023,6 +1111,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_entries_returns_full_payloads_by_default() {
+        let store = TestStore {
+            entries: vec![sample_sensitive_entry("entry-sensitive")],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(vec!["entry-sensitive".to_string()]),
+            redact: false,
+        };
+
+        let result = handler.get_entries(Parameters(params)).await.unwrap();
+        let content = &result.0.entries[0].payloads[0].content;
+
+        assert_eq!(content["message"], "visible");
+        assert_eq!(content["password"], "secret");
+        assert_eq!(content["nested"]["api_key"], "key");
+    }
+
+    #[tokio::test]
+    async fn get_entries_redacts_payloads_when_requested() {
+        let store = TestStore {
+            entries: vec![sample_sensitive_entry("entry-sensitive")],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(vec!["entry-sensitive".to_string()]),
+            redact: true,
+        };
+
+        let result = handler.get_entries(Parameters(params)).await.unwrap();
+        let content = &result.0.entries[0].payloads[0].content;
+
+        assert_eq!(content["message"], "visible");
+        assert_eq!(content["password"], "[[raymon:sensitive redacted]]");
+        assert_eq!(content["nested"]["api_key"], "[[raymon:sensitive redacted]]");
+        assert_eq!(content["nested"]["note"], "keep");
+    }
+
+    #[tokio::test]
+    async fn get_entries_redacts_payloads_when_handler_is_configured() {
+        let store = TestStore {
+            entries: vec![sample_sensitive_entry("entry-sensitive")],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus).with_payload_redaction(true);
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(vec!["entry-sensitive".to_string()]),
+            redact: false,
+        };
+
+        let result = handler.get_entries(Parameters(params)).await.unwrap();
+        let content = &result.0.entries[0].payloads[0].content;
+
+        assert_eq!(content["password"], "[[raymon:sensitive redacted]]");
+    }
+
+    #[test]
+    fn get_entries_redaction_aliases_deserialize() {
+        let redacted: GetEntriesParams = serde_json::from_value(json!({
+            "uuids": ["entry-1"],
+            "redacted": true
+        }))
+        .expect("redacted alias should deserialize");
+        let redact_payloads: GetEntriesParams = serde_json::from_value(json!({
+            "uuids": ["entry-1"],
+            "redact_payloads": true
+        }))
+        .expect("redact_payloads alias should deserialize");
+
+        assert!(redacted.redact);
+        assert!(redact_payloads.redact);
+    }
+
+    #[test]
+    fn notifications_redact_payloads_only_when_enabled() {
+        let full = notification_entry_payload(event_to_notification(
+            Event::EntryInserted(sample_sensitive_entry("entry-sensitive")),
+            false,
+        ));
+        let redacted = notification_entry_payload(event_to_notification(
+            Event::EntryInserted(sample_sensitive_entry("entry-sensitive")),
+            true,
+        ));
+
+        assert_eq!(full["payloads"][0]["content"]["password"], "secret");
+        assert_eq!(redacted["payloads"][0]["content"]["password"], "[[raymon:sensitive redacted]]");
+        assert_eq!(redacted["payloads"][0]["content"]["message"], "visible");
+    }
+
+    #[tokio::test]
     async fn get_entries_rejects_too_many_uuids() {
         let store = TestStore {
             entries: Vec::new(),
@@ -1035,6 +1221,7 @@ mod tests {
             uuids: UuidSelector::Many(
                 (0..=MAX_GET_ENTRIES_UUIDS).map(|idx| format!("entry-{idx}")).collect(),
             ),
+            redact: false,
         };
 
         let error = match handler.get_entries(Parameters(params)).await {
@@ -1056,6 +1243,7 @@ mod tests {
         let handler = RaymonMcp::new(store, bus);
         let params = GetEntriesParams {
             uuids: UuidSelector::Many(vec!["x".repeat(MAX_GET_ENTRIES_UUID_BYTES + 1)]),
+            redact: false,
         };
 
         let error = match handler.get_entries(Parameters(params)).await {
@@ -1079,8 +1267,10 @@ mod tests {
         };
         let bus = TestBus::new();
         let handler = RaymonMcp::new(store, bus);
-        let params =
-            GetEntriesParams { uuids: UuidSelector::Many(vec!["entry-large".to_string()]) };
+        let params = GetEntriesParams {
+            uuids: UuidSelector::Many(vec!["entry-large".to_string()]),
+            redact: false,
+        };
 
         let error = match handler.get_entries(Parameters(params)).await {
             Ok(_) => panic!("expected invalid params error"),

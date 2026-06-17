@@ -125,6 +125,7 @@ struct Config {
     allow_remote: bool,
     allow_insecure_remote: bool,
     allow_mcp_shutdown: bool,
+    mcp_redact_payloads: bool,
     auth_token: Option<String>,
 }
 
@@ -145,6 +146,7 @@ struct PartialConfig {
     allow_remote: Option<bool>,
     allow_insecure_remote: Option<bool>,
     allow_mcp_shutdown: Option<bool>,
+    mcp_redact_payloads: Option<bool>,
     auth_token: Option<String>,
 }
 
@@ -195,6 +197,9 @@ impl PartialConfig {
         if other.allow_mcp_shutdown.is_some() {
             self.allow_mcp_shutdown = other.allow_mcp_shutdown;
         }
+        if other.mcp_redact_payloads.is_some() {
+            self.mcp_redact_payloads = other.mcp_redact_payloads;
+        }
         if other.auth_token.is_some() {
             self.auth_token = other.auth_token;
         }
@@ -219,6 +224,7 @@ impl Config {
             allow_remote: partial.allow_remote.unwrap_or(false),
             allow_insecure_remote: partial.allow_insecure_remote.unwrap_or(false),
             allow_mcp_shutdown: partial.allow_mcp_shutdown.unwrap_or(false),
+            mcp_redact_payloads: partial.mcp_redact_payloads.unwrap_or(false),
             auth_token: partial.auth_token,
         }
     }
@@ -248,6 +254,8 @@ struct FileConfig {
     allow_insecure_remote: Option<bool>,
     #[serde(alias = "allowMcpShutdown", alias = "allow-mcp-shutdown")]
     allow_mcp_shutdown: Option<bool>,
+    #[serde(alias = "mcpRedactPayloads", alias = "mcp-redact-payloads")]
+    mcp_redact_payloads: Option<bool>,
     auth_token: Option<String>,
 }
 
@@ -275,6 +283,7 @@ impl FileConfig {
             allow_remote: self.allow_remote,
             allow_insecure_remote: self.allow_insecure_remote,
             allow_mcp_shutdown: self.allow_mcp_shutdown,
+            mcp_redact_payloads: self.mcp_redact_payloads,
             auth_token: self.auth_token,
         }
     }
@@ -1164,6 +1173,9 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
     if let Some(value) = env.get("RAYMON_ALLOW_MCP_SHUTDOWN") {
         partial.allow_mcp_shutdown = Some(parse_bool("RAYMON_ALLOW_MCP_SHUTDOWN", value)?);
     }
+    if let Some(value) = env.get("RAYMON_MCP_REDACT_PAYLOADS") {
+        partial.mcp_redact_payloads = Some(parse_bool("RAYMON_MCP_REDACT_PAYLOADS", value)?);
+    }
     if let Some(value) = env.get("RAYMON_AUTH_TOKEN").or_else(|| env.get("RAYMON_TOKEN")) {
         if !value.trim().is_empty() {
             partial.auth_token = Some(value.clone());
@@ -1337,6 +1349,7 @@ async fn run_server(
         config.max_body_bytes,
         config.max_query_len,
         config.allow_mcp_shutdown,
+        config.mcp_redact_payloads,
     )?;
     info!(%addr, "starting http server");
 
@@ -1677,14 +1690,16 @@ fn build_router(
     max_body_bytes: usize,
     max_query_len: usize,
     allow_mcp_shutdown: bool,
+    mcp_redact_payloads: bool,
 ) -> Result<Router, DynError> {
     let mcp_service =
-        RaymonMcp::streamable_http_service_with_shutdown_and_limits_and_shutdown_methods(
+        RaymonMcp::streamable_http_service_with_shutdown_and_limits_and_shutdown_methods_and_payload_redaction(
             state.core.clone(),
             state.bus.clone(),
             shutdown_tx.clone(),
             max_query_len,
             allow_mcp_shutdown,
+            mcp_redact_payloads,
         )?;
     let router_state = RouterState { app: state, mcp: mcp_service.clone() };
     let auth_state = AuthState { token: auth_token };
@@ -2190,6 +2205,7 @@ pub async fn run() -> Result<(), DynError> {
         allow_remote = config.allow_remote,
         allow_insecure_remote = config.allow_insecure_remote,
         allow_mcp_shutdown = config.allow_mcp_shutdown,
+        mcp_redact_payloads = config.mcp_redact_payloads,
         max_body_bytes = config.max_body_bytes,
         max_query_len = config.max_query_len,
         max_entries = config.max_entries,
@@ -2401,6 +2417,7 @@ mod tests {
   "host": "10.0.0.1",
   "port": 1111,
   "ide": "zed",
+  "mcpRedactPayloads": false,
   "tui": true
 }"#,
         )
@@ -2410,6 +2427,7 @@ mod tests {
         env_map.insert("RAYMON_PORT".to_string(), "2222".to_string());
         env_map.insert("RAYMON_EDITOR".to_string(), "vim".to_string());
         env_map.insert("RAYMON_ALLOW_MCP_SHUTDOWN".to_string(), "1".to_string());
+        env_map.insert("RAYMON_MCP_REDACT_PAYLOADS".to_string(), "1".to_string());
         env_map.insert("RAYMON_NO_TUI".to_string(), "1".to_string());
 
         let cli = Cli {
@@ -2433,6 +2451,7 @@ mod tests {
         assert_eq!(config.ide.as_deref(), Some("zed"));
         assert_eq!(config.editor.as_deref(), Some("nano"));
         assert!(config.allow_mcp_shutdown);
+        assert!(config.mcp_redact_payloads);
         assert!(!config.tui_enabled);
     }
 
@@ -2903,8 +2922,9 @@ mod tests {
         let (state, _) =
             build_state(temp.path(), false, 0, 0, DEFAULT_MAX_BODY_BYTES).expect("build state");
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
-        let router = build_router(state, shutdown_tx, None, 16, DEFAULT_MAX_QUERY_LEN, false)
-            .expect("router");
+        let router =
+            build_router(state, shutdown_tx, None, 16, DEFAULT_MAX_QUERY_LEN, false, false)
+                .expect("router");
 
         let response = router
             .oneshot(
@@ -2927,8 +2947,16 @@ mod tests {
         let (state, _) =
             build_state(temp.path(), false, 0, 0, DEFAULT_MAX_BODY_BYTES).expect("build state");
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
-        build_router(state, shutdown_tx, auth_token, max_body_bytes, DEFAULT_MAX_QUERY_LEN, false)
-            .expect("router")
+        build_router(
+            state,
+            shutdown_tx,
+            auth_token,
+            max_body_bytes,
+            DEFAULT_MAX_QUERY_LEN,
+            false,
+            false,
+        )
+        .expect("router")
     }
 
     async fn post_json(router: Router, uri: &str, body: serde_json::Value) -> Response {

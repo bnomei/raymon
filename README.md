@@ -172,11 +172,14 @@ Tools and their input/output shapes:
 
   Parameters:
   ```json
-  { "uuids": ["string"] }
+  { "uuids": ["string"], "redact": "boolean (optional; default false)" }
   ```
   Fallback (legacy/single): `{ "uuid": "string" }`.
   String values also accept comma-separated UUIDs: `{ "uuids": "id-1,id-2" }`.
   In comma-separated string form, whitespace in each UUID token is ignored.
+  Set `redact` (or `redacted` / `redact_payloads`) to `true` to return a redacted MCP view
+  where sensitive-looking payload fields such as passwords, tokens, API keys, cookies, and secrets
+  are replaced. Full payloads remain the default.
   Requests are limited to 100 UUIDs, 265 bytes per UUID, and a 1 MiB serialized MCP tool result.
 
   Result:
@@ -269,6 +272,7 @@ Raymon is configured primarily via environment variables:
 | `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
 | `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow binding to non-loopback addresses without auth (NOT recommended). |
 | `RAYMON_ALLOW_MCP_SHUTDOWN` | `false` | Allow custom MCP `ray/quit`, `ray/exit`, `raymon/quit`, and `raymon/exit` methods to stop Raymon. |
+| `RAYMON_MCP_REDACT_PAYLOADS` | `false` | Redact sensitive-looking payload fields in MCP `get_entries` results and MCP event notifications. Per-request redaction is also available with `raymon.get_entries` `redact: true`. |
 | `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests, including both `POST /` and `POST /mcp`. |
 | `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
 

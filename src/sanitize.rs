@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 
 const BLOB_STRING_LEN_THRESHOLD: usize = 16 * 1024;
 const BLOB_STRING_PLACEHOLDER: &str = "[[raymon:blob redacted]]";
+const SENSITIVE_FIELD_PLACEHOLDER: &str = "[[raymon:sensitive redacted]]";
 
 /// Sanitize all payload contents in-place.
 ///
@@ -18,6 +19,30 @@ const BLOB_STRING_PLACEHOLDER: &str = "[[raymon:blob redacted]]";
 pub fn sanitize_entry(entry: &mut Entry) {
     for payload in &mut entry.payloads {
         sanitize_value(&mut payload.content);
+    }
+}
+
+/// Redact sensitive-looking object fields in payload content in-place.
+///
+/// This is intentionally separate from inbound sanitization so stored entries keep full fidelity
+/// unless a presentation path explicitly asks for a redacted view.
+pub(crate) fn redact_sensitive_payload_value(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_payload_value(item);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if is_sensitive_payload_key(key) {
+                    *item = Value::String(SENSITIVE_FIELD_PLACEHOLDER.to_string());
+                } else {
+                    redact_sensitive_payload_value(item);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -82,6 +107,25 @@ fn should_redact_blob_string(value: &str) -> bool {
     }
 
     looks_like_base64(trimmed)
+}
+
+fn is_sensitive_payload_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect::<String>();
+
+    normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized == "pwd"
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("apikey")
+        || normalized.contains("authorization")
+        || normalized.contains("credential")
+        || normalized.contains("privatekey")
+        || normalized.contains("cookie")
 }
 
 fn looks_like_base64(value: &str) -> bool {
@@ -222,7 +266,7 @@ fn decode_html_entities_lossy(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_terminal_controls, sanitize_entry};
+    use super::{escape_terminal_controls, redact_sensitive_payload_value, sanitize_entry};
     use crate::raymon_core::{Entry, Origin, Payload, Screen};
     use serde_json::json;
 
@@ -333,6 +377,31 @@ mod tests {
             .expect("sanitized value");
 
         assert_eq!(sanitized, super::BLOB_STRING_PLACEHOLDER);
+    }
+
+    #[test]
+    fn redacts_sensitive_payload_fields_without_touching_other_values() {
+        let mut value = json!({
+            "message": "visible",
+            "password": "secret",
+            "profile": {
+                "api_key": "key",
+                "name": "Ada"
+            },
+            "items": [
+                { "accessToken": "token" },
+                { "note": "keep" }
+            ]
+        });
+
+        redact_sensitive_payload_value(&mut value);
+
+        assert_eq!(value["message"], "visible");
+        assert_eq!(value["password"], super::SENSITIVE_FIELD_PLACEHOLDER);
+        assert_eq!(value["profile"]["api_key"], super::SENSITIVE_FIELD_PLACEHOLDER);
+        assert_eq!(value["profile"]["name"], "Ada");
+        assert_eq!(value["items"][0]["accessToken"], super::SENSITIVE_FIELD_PLACEHOLDER);
+        assert_eq!(value["items"][1]["note"], "keep");
     }
 
     #[test]
