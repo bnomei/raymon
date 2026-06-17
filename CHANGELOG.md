@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-17
+### Added
+- document and test the MCP root fallback for JSON-RPC requests
+- add opt-in MCP payload redaction for `raymon.get_entries` and MCP event notifications
+
+### Changed
+- split HTTP routing, MCP schema, and TUI archive helpers into dedicated modules
+- avoid repeated full-result serialization in `raymon.get_entries` while preserving the response shape and size cap
+
 ## [0.5.1] - 2026-06-01
 ### Changed
 - upgrade `axum` to 0.8.9, `crossterm` to 0.29.0, `ratatui` to 0.30.0, and `tiktoken-rs` to 0.11.0
