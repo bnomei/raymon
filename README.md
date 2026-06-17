@@ -111,8 +111,11 @@ codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON
 
 ## HTTP Endpoints
 
-- `POST /`: Ray ingest endpoint (Ray payload envelope).
-  - If the request body looks like JSON-RPC (`{"jsonrpc":"2.0","method":...}`), Raymon will treat it as MCP.
+- `POST /`: Ray ingest endpoint (Ray payload envelope). Raymon also keeps a compatibility
+  fallback enabled by default here: when ingest parsing rejects the body and the JSON body looks
+  like MCP JSON-RPC (`{"jsonrpc":"2.0","method":...}` or a batch containing one), Raymon forwards
+  the request to the MCP handler instead of returning an ingest error. Valid Ray ingest envelopes
+  are still ingested normally.
 - `POST /mcp`: MCP Streamable HTTP endpoint.
 
 ## MCP Tools
