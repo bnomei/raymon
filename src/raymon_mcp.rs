@@ -83,28 +83,38 @@ pub enum McpInitError {
     NoRuntime,
 }
 
+/// A message yielded by an [`EventStream`].
+///
+/// `Lagged` is surfaced (rather than silently skipped) so the forwarder can tell connected
+/// MCP peers that notifications were dropped and they should force-refresh via `raymon.search`.
+pub enum StreamMessage {
+    Event(Event),
+    Lagged(u64),
+}
+
 /// Trait for event subscriptions that can be awaited inside the MCP server.
 pub trait EventStream: Send + 'static {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + 'a>>;
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>>;
 }
 
 impl EventStream for broadcast::Receiver<Event> {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + 'a>> {
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>> {
         Box::pin(async move {
-            loop {
-                match self.recv().await {
-                    Ok(event) => return Some(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
+            match self.recv().await {
+                Ok(event) => Some(StreamMessage::Event(event)),
+                // Surface the gap instead of swallowing it so peers can resync.
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    Some(StreamMessage::Lagged(skipped))
                 }
+                Err(broadcast::error::RecvError::Closed) => None,
             }
         })
     }
 }
 
 impl EventStream for mpsc::Receiver<Event> {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + 'a>> {
-        Box::pin(async move { self.recv().await })
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>> {
+        Box::pin(async move { self.recv().await.map(StreamMessage::Event) })
     }
 }
 
@@ -191,8 +201,13 @@ where
         let handle = tokio::runtime::Handle::try_current().map_err(|_| McpInitError::NoRuntime)?;
 
         handle.spawn(async move {
-            while let Some(event) = subscription.recv().await {
-                let notification = event_to_notification(event, redact_payloads);
+            while let Some(message) = subscription.recv().await {
+                let notification = match message {
+                    StreamMessage::Event(event) => event_to_notification(event, redact_payloads),
+                    // The subscription lagged and dropped events; tell peers to refresh from
+                    // state rather than leaving them with a silent gap.
+                    StreamMessage::Lagged(skipped) => lagged_notification(skipped),
+                };
                 broadcast_notification(&peers, notification).await;
             }
         });
@@ -641,6 +656,15 @@ fn event_to_notification(event: Event, redact_payloads: bool) -> ServerNotificat
         Event::ScreenCleared(screen) => json!({ "type": "screen_cleared", "screen": screen }),
         Event::StateCleared => json!({ "type": "state_cleared" }),
     };
+    ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
+}
+
+/// Notification emitted when the event subscription lagged and dropped `skipped` events.
+///
+/// Sent on the same `ray/event` channel clients already observe so they can force-refresh
+/// from `raymon.search` to recover the missed entries.
+fn lagged_notification(skipped: u64) -> ServerNotification {
+    let payload = json!({ "type": "lagged", "dropped": skipped });
     ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
 }
 
@@ -1110,6 +1134,47 @@ mod tests {
         assert_eq!(full["payloads"][0]["content"]["password"], "secret");
         assert_eq!(redacted["payloads"][0]["content"]["password"], "[[raymon:sensitive redacted]]");
         assert_eq!(redacted["payloads"][0]["content"]["message"], "visible");
+    }
+
+    fn notification_payload(notification: ServerNotification) -> Value {
+        match notification {
+            ServerNotification::CustomNotification(notification) => {
+                serde_json::to_value(notification.params.expect("params")).expect("params json")
+            }
+            other => panic!("expected custom notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lagged_notification_signals_drop() {
+        let payload = notification_payload(lagged_notification(7));
+        assert_eq!(payload["type"], "lagged");
+        assert_eq!(payload["dropped"], 7);
+    }
+
+    #[tokio::test]
+    async fn broadcast_event_stream_surfaces_lag_instead_of_swallowing() {
+        let (tx, rx) = broadcast::channel::<Event>(2);
+        let mut rx = rx;
+
+        // Overflow the capacity-2 channel without consuming so the receiver lags.
+        for idx in 0..4 {
+            tx.send(Event::EntryInserted(sample_entry(&format!("entry-{idx}")))).expect("send");
+        }
+
+        // The forwarder must observe the gap (rather than silently skipping it) so it can
+        // tell peers to resync.
+        match EventStream::recv(&mut rx).await {
+            Some(StreamMessage::Lagged(skipped)) => assert!(skipped >= 1),
+            Some(StreamMessage::Event(_)) => panic!("expected a lag signal, got an event"),
+            None => panic!("expected a lag signal, got stream end"),
+        }
+
+        // After reporting the lag, recv resumes delivering the still-buffered events.
+        match EventStream::recv(&mut rx).await {
+            Some(StreamMessage::Event(_)) => {}
+            other => panic!("expected a buffered event after lag, got {:?}", other.is_none()),
+        }
     }
 
     #[tokio::test]
