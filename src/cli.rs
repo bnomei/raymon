@@ -1569,8 +1569,16 @@ async fn forward_events_to_ui(
                 Ok(event) => {
                     let ui_event = match event {
                         CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
-                            seen_uuids.insert(entry.uuid.clone());
-                            Some(UiEvent::Log(log_entry_from_core(&entry)))
+                            // Honor the clear epoch on the live path too: after Ctrl+l, an
+                            // update to a pre-clear UUID keeps its original received_at, so
+                            // without this guard it would repopulate the cleared list. Mirror
+                            // the resync filter so only post-clear or already-shown entries pass.
+                            if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
+                                seen_uuids.insert(entry.uuid.clone());
+                                Some(UiEvent::Log(log_entry_from_core(&entry)))
+                            } else {
+                                None
+                            }
                         }
                         CoreEvent::ScreenCleared(screen) => {
                             Some(UiEvent::ClearScreen(screen.as_str().to_string()))
@@ -2989,5 +2997,68 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_events_respects_clear_epoch_on_live_updates() {
+        use std::time::Duration;
+
+        let screen = Screen::new("proj:host:default");
+        let make_entry = |uuid: &str, received_at: u64| CoreEntry {
+            uuid: uuid.to_string(),
+            received_at,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({ "message": uuid }),
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen.clone()),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        };
+
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let (clear_tx, clear_rx) = watch::channel(0u64);
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let core = CoreState::new(0);
+
+        let handle = tokio::spawn(forward_events_to_ui(event_rx, clear_rx, ui_tx, core));
+
+        // Pre-clear insert (received_at >= epoch 0) is forwarded.
+        event_tx.send(CoreEvent::EntryInserted(make_entry("A", 1))).expect("send");
+        match ui_rx.recv_timeout(Duration::from_secs(1)).expect("event A") {
+            UiEvent::Log(log) => assert_eq!(log.uuid, "A"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // Clear bumps the epoch to 5. A later EntryUpdated for the pre-clear UUID keeps
+        // received_at = 1 (< epoch) and must NOT repopulate the cleared list, while a
+        // genuinely new post-clear entry must still appear.
+        clear_tx.send(5).expect("clear");
+        event_tx.send(CoreEvent::EntryUpdated(make_entry("A", 1))).expect("send");
+        event_tx.send(CoreEvent::EntryInserted(make_entry("B", 6))).expect("send");
+
+        match ui_rx.recv_timeout(Duration::from_secs(1)).expect("event B") {
+            UiEvent::Log(log) => {
+                assert_eq!(log.uuid, "B", "pre-clear update must not reappear after Ctrl+l")
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // The dropped update produced no further UI event.
+        assert!(ui_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(event_tx);
+        drop(clear_tx);
+        let _ = handle.await;
     }
 }
