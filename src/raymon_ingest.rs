@@ -59,6 +59,17 @@ impl IngestError {
     }
 }
 
+/// Serialization guard held across the read-modify-write merge of a single UUID.
+///
+/// Holding the guard for the duration of the `get_entry` → merge → commit critical
+/// section ensures concurrent ingests of the same UUID cannot each read pre-merge state
+/// and lose payloads via last-writer-wins. The default [`StateStore::ingest_guard`] is a
+/// no-op for single-writer test stores.
+pub enum IngestGuard<'a> {
+    Noop,
+    Locked(std::sync::MutexGuard<'a, ()>),
+}
+
 /// Minimal state-store API needed by [`Ingestor`].
 ///
 /// This trait exists to keep the ingest pipeline decoupled from concrete storage/state
@@ -67,6 +78,15 @@ pub trait StateStore {
     fn insert_entry(&self, entry: Entry) -> Result<(), String>;
     fn update_entry(&self, entry: Entry) -> Result<(), String>;
     fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String>;
+
+    /// Acquire a serialization guard for the read-modify-write merge of `uuid`.
+    ///
+    /// Implementations that can be written from multiple threads must return a guard that
+    /// serializes per UUID; the default is a no-op for single-writer stores.
+    fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
+        let _ = uuid;
+        IngestGuard::Noop
+    }
 }
 
 impl<T> StateStore for &T
@@ -83,6 +103,10 @@ where
 
     fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String> {
         (*self).get_entry(uuid)
+    }
+
+    fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
+        (*self).ingest_guard(uuid)
     }
 }
 
@@ -171,6 +195,12 @@ where
         validate_envelope(&envelope)?;
 
         let mut entry = envelope.into_entry((self.clock)());
+
+        // Serialize the read-modify-write merge for this UUID so concurrent ingests of the
+        // same UUID cannot each read pre-merge state and drop each other's payloads. Held
+        // until the end of the function, covering get_entry through the state/storage/bus
+        // commit. Distinct UUIDs (different shards) still ingest concurrently.
+        let _ingest_guard = self.state.ingest_guard(&entry.uuid);
 
         let existing = self.state.get_entry(&entry.uuid).map_err(IngestError::StateStore)?;
 
@@ -332,6 +362,57 @@ mod tests {
 
         fn get_entry(&self, _uuid: &str) -> Result<Option<Entry>, String> {
             Ok(None)
+        }
+    }
+
+    /// A shared, thread-safe state store that serializes per-UUID merges via `ingest_guard`
+    /// and sleeps inside `get_entry` to widen the read-modify-write race window. Without the
+    /// guard this would drop payloads under concurrent same-UUID ingest.
+    struct SharedConcurrentState {
+        entries: std::sync::Mutex<Vec<Entry>>,
+        locks: [std::sync::Mutex<()>; 16],
+        get_delay: std::time::Duration,
+    }
+
+    impl SharedConcurrentState {
+        fn new(get_delay: std::time::Duration) -> Self {
+            Self {
+                entries: std::sync::Mutex::new(Vec::new()),
+                locks: std::array::from_fn(|_| std::sync::Mutex::new(())),
+                get_delay,
+            }
+        }
+    }
+
+    impl StateStore for SharedConcurrentState {
+        fn insert_entry(&self, entry: Entry) -> Result<(), String> {
+            self.entries.lock().map_err(|_| "poisoned".to_string())?.push(entry);
+            Ok(())
+        }
+
+        fn update_entry(&self, entry: Entry) -> Result<(), String> {
+            let mut guard = self.entries.lock().map_err(|_| "poisoned".to_string())?;
+            if let Some(existing) = guard.iter_mut().find(|item| item.uuid == entry.uuid) {
+                *existing = entry;
+            } else {
+                guard.push(entry);
+            }
+            Ok(())
+        }
+
+        fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String> {
+            std::thread::sleep(self.get_delay);
+            let guard = self.entries.lock().map_err(|_| "poisoned".to_string())?;
+            Ok(guard.iter().find(|entry| entry.uuid == uuid).cloned())
+        }
+
+        fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(uuid, &mut hasher);
+            let shard = (std::hash::Hasher::finish(&hasher) as usize) % self.locks.len();
+            IngestGuard::Locked(
+                self.locks[shard].lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
         }
     }
 
@@ -507,6 +588,44 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::EntryInserted(_)));
         assert!(matches!(events[1], Event::EntryUpdated(_)));
+    }
+
+    #[test]
+    fn concurrent_same_uuid_ingest_preserves_all_payloads() {
+        const N: usize = 8;
+        let state = SharedConcurrentState::new(std::time::Duration::from_millis(5));
+        let storage = TestStorage::default();
+        let bus = TestBus::default();
+
+        std::thread::scope(|scope| {
+            for i in 0..N {
+                let state = &state;
+                let storage = &storage;
+                let bus = &bus;
+                scope.spawn(move || {
+                    let ingestor = Ingestor::new(state, storage, bus, || 42_000);
+                    let envelope = json!({
+                        "uuid": "shared-uuid",
+                        "payloads": [{
+                            "type": "log",
+                            "content": { "message": format!("payload-{i}") },
+                            "origin": { "hostname": "device" }
+                        }],
+                        "meta": { "project": "ray", "host": "device" }
+                    });
+                    let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
+                    assert_eq!(response.status, 200);
+                });
+            }
+        });
+
+        let entries = state.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "all ingests target the same UUID");
+        assert_eq!(
+            entries[0].payloads.len(),
+            N,
+            "concurrent same-UUID merges must not drop payloads"
+        );
     }
 
     #[rstest]

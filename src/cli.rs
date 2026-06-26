@@ -313,10 +313,18 @@ impl AppState {
     }
 }
 
+/// Number of shards used to serialize per-UUID ingest merges. A power of two so the hash
+/// can be masked; sized to comfortably exceed the HTTP concurrency limit so distinct UUIDs
+/// rarely contend.
+const INGEST_MERGE_SHARDS: usize = 128;
+
 #[derive(Clone)]
 struct CoreState {
     inner: Arc<RwLock<StateInner>>,
     max_entries: usize,
+    /// Per-UUID serialization locks for the ingest read-modify-write merge, sharded by
+    /// UUID hash and shared across all `IngestState` clones via `Arc`.
+    merge_locks: Arc<[Mutex<()>; INGEST_MERGE_SHARDS]>,
 }
 
 #[derive(Default)]
@@ -335,7 +343,18 @@ enum StateError {
 
 impl CoreState {
     fn new(max_entries: usize) -> Self {
-        Self { inner: Arc::new(RwLock::new(StateInner::default())), max_entries }
+        Self {
+            inner: Arc::new(RwLock::new(StateInner::default())),
+            max_entries,
+            merge_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+        }
+    }
+
+    /// Lock the merge shard for `uuid`, recovering from a poisoned lock (the guarded data
+    /// lives in the separate `RwLock`, so the coordination lock can be safely reused).
+    fn merge_guard(&self, uuid: &str) -> std::sync::MutexGuard<'_, ()> {
+        let shard = (log_id(uuid) as usize) % INGEST_MERGE_SHARDS;
+        self.merge_locks[shard].lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn insert(&self, entry: CoreEntry) -> Result<(), StateError> {
@@ -559,6 +578,10 @@ impl crate::raymon_ingest::StateStore for IngestState {
 
     fn get_entry(&self, uuid: &str) -> Result<Option<CoreEntry>, String> {
         self.core.get(uuid).map_err(|error| error.to_string())
+    }
+
+    fn ingest_guard(&self, uuid: &str) -> crate::raymon_ingest::IngestGuard<'_> {
+        crate::raymon_ingest::IngestGuard::Locked(self.core.merge_guard(uuid))
     }
 }
 
