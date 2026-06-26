@@ -1,3 +1,8 @@
+//! In-memory index over the append-only entries JSONL for listing, filtering, and offset lookup.
+//!
+//! Tracks first-seen UUID order separately from physical update lines so retention and scans can
+//! budget by distinct entries.
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -29,16 +34,14 @@ pub(crate) struct Index {
 }
 
 impl Index {
-    /// Number of distinct entries (by UUID), not physical JSONL lines. Retention budgets
-    /// the count of distinct entries, so duplicate update lines for one UUID do not inflate
-    /// it and evict still-wanted entries.
+    /// Distinct entries by UUID, not physical JSONL lines. Duplicate update lines for one UUID do
+    /// not inflate retention budgets.
     pub(crate) fn distinct_entry_count(&self) -> usize {
         self.order.len()
     }
 
-    /// Latest offset for each of the newest `keep` distinct entries (by first-seen order,
-    /// matching core-state eviction), returned in ascending file order so a rewrite keeps
-    /// one chronologically-ordered line per retained UUID.
+    /// Latest offset for each of the newest `keep` distinct entries, returned in ascending file
+    /// order so a rewrite keeps one chronologically ordered line per retained UUID.
     pub(crate) fn tail_offsets_by_entry(&self, keep: usize) -> Vec<(u64, u64)> {
         let len = self.order.len();
         let start = len.saturating_sub(keep);

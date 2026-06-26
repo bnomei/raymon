@@ -1,4 +1,6 @@
-//! MCP handlers for Raymon using rmcp.
+//! MCP server for Raymon: entry search tools and live `ray/event` notifications over rmcp.
+//!
+//! Forwards core [`Event`]s to connected peers and surfaces subscription lag so clients can resync.
 
 use std::any::Any;
 use std::fmt::Display;
@@ -34,7 +36,7 @@ pub use schema::{
     McpEntry, McpOrigin, McpPayload, StringListSelector, UuidSelector,
 };
 
-/// Streamable HTTP service type for mounting on `/mcp` with axum/tower.
+/// Streamable HTTP MCP service mounted at `/mcp` behind axum or tower.
 pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSessionManager>;
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -60,6 +62,7 @@ fn prune_closed_peers<P: PeerHealth>(peers: &mut Vec<P>) {
     peers.retain(|peer| !peer.transport_closed());
 }
 
+// Drop the oldest peers when the cap is exceeded so the forwarder stays bounded.
 fn enforce_peer_cap<P>(peers: &mut Vec<P>, cap: usize) {
     if cap == 0 {
         peers.clear();
@@ -83,16 +86,16 @@ pub enum McpInitError {
     NoRuntime,
 }
 
-/// A message yielded by an [`EventStream`].
-///
-/// `Lagged` is surfaced (rather than silently skipped) so the forwarder can tell connected
-/// MCP peers that notifications were dropped and they should force-refresh via `raymon.search`.
+/// Event-stream item for the MCP forwarder. `Lagged` exposes dropped notifications so peers can
+/// resync via `raymon.search` instead of silently missing entries.
 pub enum StreamMessage {
     Event(Event),
     Lagged(u64),
 }
 
-/// Trait for event subscriptions that can be awaited inside the MCP server.
+/// Async event subscription used by the MCP notification forwarder.
+///
+/// Implementations must surface broadcast lag as [`StreamMessage::Lagged`] rather than dropping it.
 pub trait EventStream: Send + 'static {
     fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>>;
 }
@@ -102,7 +105,6 @@ impl EventStream for broadcast::Receiver<Event> {
         Box::pin(async move {
             match self.recv().await {
                 Ok(event) => Some(StreamMessage::Event(event)),
-                // Surface the gap instead of swallowing it so peers can resync.
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     Some(StreamMessage::Lagged(skipped))
                 }
@@ -189,6 +191,7 @@ where
         }
     }
 
+    /// Spawn the task that forwards core events and lag signals to connected MCP peers.
     pub fn start_event_forwarder(&self) -> Result<(), McpInitError> {
         if self.forwarder_started.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -204,8 +207,6 @@ where
             while let Some(message) = subscription.recv().await {
                 let notification = match message {
                     StreamMessage::Event(event) => event_to_notification(event, redact_payloads),
-                    // The subscription lagged and dropped events; tell peers to refresh from
-                    // state rather than leaving them with a silent gap.
                     StreamMessage::Lagged(skipped) => lagged_notification(skipped),
                 };
                 broadcast_notification(&peers, notification).await;
@@ -215,6 +216,7 @@ where
         Ok(())
     }
 
+    /// Build a streamable HTTP MCP service with default configuration.
     pub fn streamable_http_service(
         state: S,
         bus: B,
@@ -222,6 +224,7 @@ where
         Self::streamable_http_service_with_config(state, bus, StreamableHttpServerConfig::default())
     }
 
+    /// Build a streamable HTTP MCP service wired to a process shutdown channel.
     pub fn streamable_http_service_with_shutdown(
         state: S,
         bus: B,
@@ -236,6 +239,7 @@ where
         ))
     }
 
+    /// Build a streamable HTTP MCP service with shutdown wiring and a query-length cap.
     pub fn streamable_http_service_with_shutdown_and_limits(
         state: S,
         bus: B,
@@ -251,6 +255,7 @@ where
         ))
     }
 
+    /// Like [`Self::streamable_http_service_with_shutdown_and_limits`] with optional shutdown tools.
     pub fn streamable_http_service_with_shutdown_and_limits_and_shutdown_methods(
         state: S,
         bus: B,
@@ -268,6 +273,7 @@ where
         )
     }
 
+    /// Full CLI factory: shutdown wiring, query cap, optional shutdown tools, and payload redaction.
     pub fn streamable_http_service_with_shutdown_and_limits_and_shutdown_methods_and_payload_redaction(
         state: S,
         bus: B,
@@ -287,6 +293,7 @@ where
         ))
     }
 
+    /// Build a streamable HTTP MCP service with custom rmcp transport configuration.
     pub fn streamable_http_service_with_config(
         state: S,
         bus: B,
@@ -304,11 +311,13 @@ where
         enforce_peer_cap(&mut peers, MAX_MCP_PEERS);
     }
 
+    /// Allow MCP clients to invoke process shutdown tools.
     pub fn with_shutdown_methods(mut self, allow_shutdown_methods: bool) -> Self {
         self.allow_shutdown_methods = allow_shutdown_methods;
         self
     }
 
+    /// Redact sensitive payload fields in MCP tool results and `ray/event` notifications.
     pub fn with_payload_redaction(mut self, redact_payloads: bool) -> Self {
         self.redact_payloads = redact_payloads;
         self
@@ -472,10 +481,8 @@ where
         request: InitializeRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        // Treat a repeat `initialize` on the same open connection as idempotent: register
-        // the peer only on the first one. Otherwise the same peer would be pushed onto
-        // `peers` again (prune_closed_peers keeps it since the transport is open), and the
-        // event forwarder would send every `ray/event` notification to that client twice.
+        // Repeat initialize on one connection is idempotent: register the peer only once so the
+        // forwarder does not deliver duplicate `ray/event` notifications.
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
             self.register_peer(context.peer.clone()).await;
@@ -663,10 +670,7 @@ fn event_to_notification(event: Event, redact_payloads: bool) -> ServerNotificat
     ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
 }
 
-/// Notification emitted when the event subscription lagged and dropped `skipped` events.
-///
-/// Sent on the same `ray/event` channel clients already observe so they can force-refresh
-/// from `raymon.search` to recover the missed entries.
+/// `ray/event` notification telling clients the subscription lagged and they should refresh.
 fn lagged_notification(skipped: u64) -> ServerNotification {
     let payload = json!({ "type": "lagged", "dropped": skipped });
     ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
@@ -1052,8 +1056,6 @@ mod tests {
         let bus = TestBus::new();
         let handler = RaymonMcp::new(store, bus);
 
-        // Trailing, leading, and doubled commas leave empty segments that must be ignored
-        // rather than failing the whole batch.
         let params: GetEntriesParams = serde_json::from_value(json!({
             "uuids": ",entry-1,,entry-2,"
         }))
@@ -1184,20 +1186,16 @@ mod tests {
         let (tx, rx) = broadcast::channel::<Event>(2);
         let mut rx = rx;
 
-        // Overflow the capacity-2 channel without consuming so the receiver lags.
         for idx in 0..4 {
             tx.send(Event::EntryInserted(sample_entry(&format!("entry-{idx}")))).expect("send");
         }
 
-        // The forwarder must observe the gap (rather than silently skipping it) so it can
-        // tell peers to resync.
         match EventStream::recv(&mut rx).await {
             Some(StreamMessage::Lagged(skipped)) => assert!(skipped >= 1),
             Some(StreamMessage::Event(_)) => panic!("expected a lag signal, got an event"),
             None => panic!("expected a lag signal, got stream end"),
         }
 
-        // After reporting the lag, recv resumes delivering the still-buffered events.
         match EventStream::recv(&mut rx).await {
             Some(StreamMessage::Event(_)) => {}
             other => panic!("expected a buffered event after lag, got {:?}", other.is_none()),

@@ -3,6 +3,14 @@
 //! Most users interact with Raymon via the `raymon` binary. This crate also exposes a small API so
 //! Raymon can be embedded and launched from Rust.
 //!
+//! Public modules:
+//! - [`raymon_core`] — IO-free entry, filter, event, and state contracts
+//! - [`raymon_ingest`] — HTTP ingest pipeline
+//! - [`raymon_storage`] — durable JSONL persistence and indexing
+//! - [`raymon_mcp`] — MCP tools and live notifications
+//! - [`raymon_tui`] — terminal log browser
+//! - [`colors`] — canonical Ray color names
+//!
 //! # Running
 //! ```no_run
 //! #[tokio::main]

@@ -3,6 +3,7 @@
 //! This module is intentionally IO-free and is shared across the HTTP ingest, storage, MCP and TUI
 //! layers.
 
+/// Normalized domain types for entries, payloads, and Ray wire envelopes.
 pub mod types {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
@@ -43,7 +44,7 @@ pub mod types {
         }
     }
 
-    /// Origin metadata describing where a payload came from.
+    /// Normalized origin metadata describing where a payload came from.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Origin {
         pub project: String,
@@ -146,7 +147,7 @@ pub mod types {
         }
     }
 
-    /// Origin fields as sent by Ray clients.
+    /// Origin fields as sent by Ray clients before normalization into [`Origin`].
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct RayOrigin {
         #[serde(default, alias = "functionName")]
@@ -159,7 +160,7 @@ pub mod types {
         pub hostname: String,
     }
 
-    /// Single Ray payload item.
+    /// Single Ray payload item inside an inbound [`RayEnvelope`].
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct RayPayload {
         #[serde(rename = "type")]
@@ -168,7 +169,7 @@ pub mod types {
         pub origin: RayOrigin,
     }
 
-    /// Optional metadata block carried by Ray envelopes.
+    /// Optional project/host/screen metadata carried by Ray envelopes.
     #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
     pub struct RayMeta {
         #[serde(default, alias = "projectName", alias = "project_name")]
@@ -339,6 +340,7 @@ pub mod types {
     }
 }
 
+/// Entry and payload matching for MCP search, TUI filters, and core list queries.
 pub mod filters {
     use super::types::{Entry, Payload, Screen};
     use crate::colors::canonical_color_name;
@@ -379,11 +381,13 @@ pub mod filters {
     }
 
     impl Filters {
+        /// Return whether `entry` matches the current query and facet constraints.
         pub fn matches_entry(&self, entry: &Entry) -> Result<bool, FilterError> {
             let query = self.compile_query()?;
             Ok(self.matches_entry_with_query(entry, query.as_ref()))
         }
 
+        /// Filter and paginate entries in iterator order.
         pub fn apply<'a>(
             &self,
             entries: impl IntoIterator<Item = &'a Entry>,
@@ -392,6 +396,7 @@ pub mod filters {
             Ok(self.apply_with_query(entries, query.as_ref()))
         }
 
+        /// Like [`Self::apply`] but also returns the total match count before pagination.
         pub fn apply_with_count<'a>(
             &self,
             entries: impl IntoIterator<Item = &'a Entry>,
@@ -400,6 +405,7 @@ pub mod filters {
             Ok(self.apply_with_query_and_count(entries, query.as_ref()))
         }
 
+        /// Parallel filter path for large entry slices when the `rayon` feature is enabled.
         pub fn apply_parallel<'a>(
             &self,
             entries: &'a [Entry],
@@ -837,6 +843,7 @@ pub mod filters {
     }
 }
 
+/// Mutable in-memory entry store contract shared by CLI, ingest, and MCP adapters.
 pub mod state {
     use super::filters::Filters;
     use super::types::{Entry, Screen};
@@ -845,10 +852,15 @@ pub mod state {
     pub trait StateStore {
         type Error;
 
+        /// Insert a new entry keyed by UUID.
         fn insert_entry(&mut self, entry: Entry) -> Result<(), Self::Error>;
+        /// Replace an existing entry keyed by UUID.
         fn update_entry(&mut self, entry: Entry) -> Result<(), Self::Error>;
+        /// Fetch one entry by UUID.
         fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, Self::Error>;
+        /// List entries matching `filters` in chronological order.
         fn list_entries(&self, filters: &Filters) -> Result<Vec<Entry>, Self::Error>;
+        /// Like [`Self::list_entries`] but also returns the total match count before pagination.
         fn list_entries_with_count(
             &self,
             filters: &Filters,
@@ -860,12 +872,16 @@ pub mod state {
             let entries = self.list_entries(filters)?;
             Ok((entries, count))
         }
+        /// Return the distinct screens currently represented in state.
         fn list_screens(&self) -> Result<Vec<Screen>, Self::Error>;
+        /// Remove all entries belonging to `screen`.
         fn clear_screen(&mut self, screen: &Screen) -> Result<(), Self::Error>;
+        /// Remove every entry from live state.
         fn clear_all(&mut self) -> Result<(), Self::Error>;
     }
 }
 
+/// Domain events broadcast when entries are inserted, updated, or cleared.
 pub mod events {
     use super::types::{Entry, Screen};
     use serde::{Deserialize, Serialize};
@@ -884,7 +900,9 @@ pub mod events {
         type Error;
         type Subscription;
 
+        /// Broadcast a state-change event to subscribers.
         fn emit(&self, event: Event) -> Result<(), Self::Error>;
+        /// Open a new subscription to state-change events.
         fn subscribe(&self) -> Result<Self::Subscription, Self::Error>;
     }
 }

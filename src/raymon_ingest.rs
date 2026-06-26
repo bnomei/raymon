@@ -1,4 +1,7 @@
-//! HTTP ingest handlers for Raymon.
+//! HTTP ingest pipeline for Ray-compatible JSON envelopes.
+//!
+//! Parses inbound bodies, merges duplicate UUIDs, and commits to core state, durable storage,
+//! and the event bus in an order that keeps live queries consistent with persisted data.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,12 +62,8 @@ impl IngestError {
     }
 }
 
-/// Serialization guard held across the read-modify-write merge of a single UUID.
-///
-/// Holding the guard for the duration of the `get_entry` → merge → commit critical
-/// section ensures concurrent ingests of the same UUID cannot each read pre-merge state
-/// and lose payloads via last-writer-wins. The default [`StateStore::ingest_guard`] is a
-/// no-op for single-writer test stores.
+/// Held across the read-modify-write merge of one UUID so concurrent same-UUID ingests cannot
+/// lose payloads via last-writer-wins. The default [`StateStore::ingest_guard`] is a no-op.
 pub enum IngestGuard<'a> {
     Noop,
     Locked(std::sync::MutexGuard<'a, ()>),
@@ -79,10 +78,8 @@ pub trait StateStore {
     fn update_entry(&self, entry: Entry) -> Result<(), String>;
     fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String>;
 
-    /// Acquire a serialization guard for the read-modify-write merge of `uuid`.
-    ///
-    /// Implementations that can be written from multiple threads must return a guard that
-    /// serializes per UUID; the default is a no-op for single-writer stores.
+    /// Serialize the read-modify-write merge of `uuid`. Multi-writer stores must return a real
+    /// guard; the default is a no-op for single-writer test doubles.
     fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
         let _ = uuid;
         IngestGuard::Noop
@@ -196,10 +193,7 @@ where
 
         let mut entry = envelope.into_entry((self.clock)());
 
-        // Serialize the read-modify-write merge for this UUID so concurrent ingests of the
-        // same UUID cannot each read pre-merge state and drop each other's payloads. Held
-        // until the end of the function, covering get_entry through the state/storage/bus
-        // commit. Distinct UUIDs (different shards) still ingest concurrently.
+        // Held through get_entry and commit so same-UUID ingests cannot interleave merges.
         let _ingest_guard = self.state.ingest_guard(&entry.uuid);
 
         let existing = self.state.get_entry(&entry.uuid).map_err(IngestError::StateStore)?;
@@ -214,9 +208,8 @@ where
         crate::sanitize::sanitize_entry(&mut entry);
         self.validate_entry_size(&entry)?;
 
-        // Update core state before appending to durable storage. If the state update
-        // fails (e.g. a poisoned lock), no JSONL line is written, so storage never holds
-        // an entry that is invisible to live MCP/TUI queries until the next restart.
+        // Core state before durable storage: a state failure must not leave orphaned JSONL lines
+        // that live MCP/TUI queries cannot see until restart.
         if update {
             self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
             self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
@@ -347,7 +340,6 @@ mod tests {
         }
     }
 
-    /// A state store whose writes always fail, simulating a poisoned lock.
     #[derive(Default)]
     struct FailingState;
 
@@ -365,9 +357,6 @@ mod tests {
         }
     }
 
-    /// A shared, thread-safe state store that serializes per-UUID merges via `ingest_guard`
-    /// and sleeps inside `get_entry` to widen the read-modify-write race window. Without the
-    /// guard this would drop payloads under concurrent same-UUID ingest.
     struct SharedConcurrentState {
         entries: std::sync::Mutex<Vec<Entry>>,
         locks: [std::sync::Mutex<()>; 16],
@@ -550,9 +539,6 @@ mod tests {
         let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
         assert_eq!(response.status, 500);
 
-        // Core state is updated before storage, so a state failure must leave no JSONL
-        // line behind (which would be invisible to live MCP/TUI until a restart) and
-        // emit no bus event.
         assert!(
             storage.entries.lock().unwrap().is_empty(),
             "state failure must not append an orphaned storage entry"

@@ -1,3 +1,7 @@
+//! Low-level JSONL append, random access, and scan helpers for the entries log file.
+//!
+//! Corrupt lines are skipped during scans so a partial write does not block retention or reload.
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;

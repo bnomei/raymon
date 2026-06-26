@@ -142,6 +142,7 @@ impl EntryFilter {
     }
 }
 
+/// Append-only JSONL entry store with an in-memory index for listing and offset lookup.
 pub struct Storage {
     root: PathBuf,
     data_dir: PathBuf,
@@ -299,9 +300,7 @@ fn enforce_retention(
         return Ok(None);
     }
 
-    // Budget by distinct entry (UUID), not physical JSONL lines. Track the latest line per
-    // UUID and the first-seen order so retention keeps the newest `N` distinct entries (one
-    // line each), matching the documented behavior and core-state eviction.
+    // Budget retention by distinct UUID, keeping the newest `N` entries (one line each).
     let mut latest: HashMap<String, (u64, u64)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     jsonl::scan_entries(entries_path, |offset, len, entry| {
@@ -505,8 +504,6 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let mut storage = Storage::new_with_retention(dir.path(), 2).expect("storage");
 
-        // Four updates to a single UUID is still just one distinct entry, well under the
-        // cap of 2, so retention must not fire and rewrite the file.
         for idx in 1..=4 {
             let input = EntryInput {
                 id: "entry-1".to_string(),
@@ -523,7 +520,6 @@ mod tests {
             storage.append_entry(input).expect("append entry");
         }
 
-        // No pruning: all four physical update lines are preserved (one distinct entry).
         let entries_path = dir.path().join(DEFAULT_DATA_DIR).join(ENTRIES_FILE);
         let jsonl = std::fs::read_to_string(entries_path).expect("read entries");
         assert_eq!(jsonl.lines().count(), 4);
@@ -537,9 +533,6 @@ mod tests {
 
     #[test]
     fn retention_keeps_distinct_entries_at_cap_despite_updates() {
-        // Reproduces the devana counterexample: cap 2, two distinct UUIDs each ingested
-        // twice (insert + update). The store holds exactly 2 distinct entries, so neither
-        // may be evicted even though there are 4 physical lines.
         let dir = TempDir::new().expect("temp dir");
         let mut storage = Storage::new_with_retention(dir.path(), 2).expect("storage");
 
@@ -564,14 +557,11 @@ mod tests {
         append(&mut storage, "entry-b", 1);
         append(&mut storage, "entry-b", 2);
 
-        // Both distinct entries survive (the older UUID is not dropped).
         let a = storage.get_entry_by_id("entry-a").expect("get a").expect("entry-a missing");
         assert_eq!(a.summary, "entry-a-v2");
         let b = storage.get_entry_by_id("entry-b").expect("get b").expect("entry-b missing");
         assert_eq!(b.summary, "entry-b-v2");
 
-        // Survives a reload from the persisted file (the startup retention path is also
-        // entry-based, so no distinct entry is lost on restart).
         drop(storage);
         let reloaded = Storage::new_with_retention(dir.path(), 2).expect("reload");
         let ids: std::collections::HashSet<String> =

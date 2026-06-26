@@ -1,3 +1,8 @@
+//! CLI runtime that wires HTTP ingest, durable storage, core state, MCP, and the terminal UI.
+//!
+//! Owns process lifecycle and bridges the in-memory entry cache with concurrent ingest and live
+//! MCP/TUI subscribers.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
@@ -313,17 +318,14 @@ impl AppState {
     }
 }
 
-/// Number of shards used to serialize per-UUID ingest merges. A power of two so the hash
-/// can be masked; sized to comfortably exceed the HTTP concurrency limit so distinct UUIDs
-/// rarely contend.
+// Shards that serialize per-UUID ingest merges; sized above HTTP concurrency so distinct UUIDs
+// rarely contend on the same lock.
 const INGEST_MERGE_SHARDS: usize = 128;
 
 #[derive(Clone)]
 struct CoreState {
     inner: Arc<RwLock<StateInner>>,
     max_entries: usize,
-    /// Per-UUID serialization locks for the ingest read-modify-write merge, sharded by
-    /// UUID hash and shared across all `IngestState` clones via `Arc`.
     merge_locks: Arc<[Mutex<()>; INGEST_MERGE_SHARDS]>,
 }
 
@@ -350,8 +352,7 @@ impl CoreState {
         }
     }
 
-    /// Lock the merge shard for `uuid`, recovering from a poisoned lock (the guarded data
-    /// lives in the separate `RwLock`, so the coordination lock can be safely reused).
+    // Coordination lock only; poison recovery is safe because guarded data lives in the RwLock.
     fn merge_guard(&self, uuid: &str) -> std::sync::MutexGuard<'_, ()> {
         let shard = (log_id(uuid) as usize) % INGEST_MERGE_SHARDS;
         self.merge_locks[shard].lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -475,9 +476,8 @@ impl CoreStateStoreTrait for CoreState {
         filters: &Filters,
     ) -> Result<(Vec<CoreEntry>, usize), Self::Error> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
-        // When a scan window is bounded, take it from the *newest* entries (tail of
-        // `order`) so recent logs stay discoverable, then restore chronological order
-        // within the window so result/pagination ordering is unchanged.
+        // Bounded scan windows sample the newest entries (tail of order), then restore
+        // chronological order within the window for stable pagination.
         let window: Vec<&CoreEntry> = match filters.scan_limit {
             Some(scan_limit) => inner
                 .order
@@ -489,9 +489,7 @@ impl CoreStateStoreTrait for CoreState {
                 .into_iter()
                 .rev()
                 .collect(),
-            None => {
-                inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)).collect()
-            }
+            None => inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)).collect(),
         };
         let (matches, count) = filters
             .apply_with_count(window.into_iter())
@@ -1592,10 +1590,8 @@ async fn forward_events_to_ui(
             }
             res = event_rx.recv() => match res {
                 Ok(event) => {
-                    // Honor the clear epoch on the live path too: after Ctrl+l, an update
-                    // to a pre-clear UUID keeps its original received_at, so without this
-                    // guard it would repopulate the cleared list. Mirror the resync filter so
-                    // only post-clear or already-shown entries pass.
+                    // After a clear, pre-clear UUIDs keep their original received_at; suppress
+                    // updates that would repopulate a cleared list unless already visible.
                     let mut visible = |entry: &CoreEntry| -> bool {
                         if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
                             seen_uuids.insert(entry.uuid.clone());
@@ -1607,8 +1603,6 @@ async fn forward_events_to_ui(
                     let ui_event = match event {
                         CoreEvent::EntryInserted(entry) => visible(&entry)
                             .then(|| UiEvent::Log(log_entry_from_core(&entry))),
-                        // Updates upsert the existing row by UUID so re-ingested entries
-                        // refresh in place instead of appending a stale duplicate.
                         CoreEvent::EntryUpdated(entry) => visible(&entry)
                             .then(|| UiEvent::UpdateLog(log_entry_from_core(&entry))),
                         CoreEvent::ScreenCleared(screen) => {
@@ -2420,10 +2414,7 @@ mod tests {
         let path = temp.path().join("ray.json");
         fs::write(&path, r#"{ "host": "0.0.0.0", "auth_token": "" }"#).expect("write");
         let partial = load_config_file(&path).expect("load");
-        assert!(
-            partial.auth_token.is_none(),
-            "empty auth_token must not count as configured auth"
-        );
+        assert!(partial.auth_token.is_none(), "empty auth_token must not count as configured auth");
 
         fs::write(&path, r#"{ "auth_token": "   " }"#).expect("write");
         let partial = load_config_file(&path).expect("load");
@@ -2646,8 +2637,6 @@ mod tests {
             core.insert(entry).expect("insert");
         }
 
-        // Bounded scan window must cover the newest entries (tail of order), not the
-        // oldest, while preserving chronological order within the window.
         let filters = Filters { scan_limit: Some(3), ..Default::default() };
         let (entries, count) =
             CoreStateStoreTrait::list_entries_with_count(&core, &filters).expect("list");
@@ -2655,7 +2644,6 @@ mod tests {
         assert_eq!(uuids, vec!["entry-7", "entry-8", "entry-9"]);
         assert_eq!(count, 3);
 
-        // Without a scan window, all entries remain visible in chronological order.
         let (all, all_count) =
             CoreStateStoreTrait::list_entries_with_count(&core, &Filters::default()).expect("list");
         assert_eq!(all.len(), 10);
@@ -3064,16 +3052,12 @@ mod tests {
 
         let handle = tokio::spawn(forward_events_to_ui(event_rx, clear_rx, ui_tx, core));
 
-        // Pre-clear insert (received_at >= epoch 0) is forwarded.
         event_tx.send(CoreEvent::EntryInserted(make_entry("A", 1))).expect("send");
         match ui_rx.recv_timeout(Duration::from_secs(1)).expect("event A") {
             UiEvent::Log(log) => assert_eq!(log.uuid, "A"),
             other => panic!("unexpected event: {other:?}"),
         }
 
-        // Clear bumps the epoch to 5. A later EntryUpdated for the pre-clear UUID keeps
-        // received_at = 1 (< epoch) and must NOT repopulate the cleared list, while a
-        // genuinely new post-clear entry must still appear.
         clear_tx.send(5).expect("clear");
         event_tx.send(CoreEvent::EntryUpdated(make_entry("A", 1))).expect("send");
         event_tx.send(CoreEvent::EntryInserted(make_entry("B", 6))).expect("send");
@@ -3085,7 +3069,6 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
 
-        // The dropped update produced no further UI event.
         assert!(ui_rx.recv_timeout(Duration::from_millis(100)).is_err());
 
         drop(event_tx);

@@ -1,3 +1,7 @@
+//! JSONL archive files for the TUI: live buffering, export snapshots, and directory scanning.
+//!
+//! Archives are ordinary `.jsonl` files under the configured archive directory.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -5,7 +9,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
-/// File-backed archive entry.
+/// One `.jsonl` archive visible in the TUI archives pane.
 #[derive(Debug, Clone)]
 pub struct ArchiveFile {
     pub name: String,
