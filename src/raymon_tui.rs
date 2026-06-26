@@ -2558,7 +2558,15 @@ impl Tui {
                 }
             }
         }
-        let _ = writer.flush();
+        // The entries are only buffered until flush, so a flush failure (e.g. disk full)
+        // means the file is truncated/empty. Surface it instead of reporting success with a
+        // count that overstates what is durably on disk, matching flush_live_archive.
+        if let Err(err) = writer.flush() {
+            drop(writer);
+            let _ = std::fs::remove_file(&path);
+            self.state.detail_notice = Some(format!("archive failed: {err}"));
+            return;
+        }
 
         if written == 0 {
             self.state.detail_notice = Some("archive produced no entries".to_string());
@@ -6098,6 +6106,44 @@ mod tests {
         }
 
         assert!(fs::metadata(&live_path).expect("metadata").len() > 0);
+    }
+
+    #[test]
+    fn archive_current_view_writes_and_counts_entries() {
+        let dir = tempdir().expect("tempdir");
+        let config =
+            TuiConfig { archive_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let value = Arc::new(Mutex::new(String::new()));
+        let clipboard = MockClipboard { value };
+        let mut tui = Tui::with_clipboard(config, Box::new(clipboard));
+
+        for i in 0..3u64 {
+            tui.push_log(LogEntry {
+                id: i,
+                uuid: format!("uuid-{i}"),
+                message: format!("message-{i}"),
+                detail: "{}".to_string(),
+                origin: None,
+                origin_file: None,
+                origin_line: None,
+                timestamp: Some(1_000 + i),
+                entry_type: Some("log".to_string()),
+                color: None,
+                screen: Some("main".to_string()),
+            });
+        }
+        tui.recompute_filter();
+        assert_eq!(tui.state.filtered.len(), 3);
+
+        tui.archive_current_view();
+
+        // The selection archive is registered with the full count only after a successful
+        // flush, and the file is durably written with one line per entry.
+        let archive =
+            tui.state.archives.iter().find(|archive| !archive.live).expect("archive registered");
+        assert_eq!(archive.count, 3);
+        let contents = std::fs::read_to_string(&archive.path).expect("read archive");
+        assert_eq!(contents.lines().count(), 3);
     }
 
     #[rstest]
