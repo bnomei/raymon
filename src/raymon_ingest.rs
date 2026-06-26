@@ -184,13 +184,16 @@ where
         crate::sanitize::sanitize_entry(&mut entry);
         self.validate_entry_size(&entry)?;
 
+        // Update core state before appending to durable storage. If the state update
+        // fails (e.g. a poisoned lock), no JSONL line is written, so storage never holds
+        // an entry that is invisible to live MCP/TUI queries until the next restart.
         if update {
-            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
+            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.bus.emit(Event::EntryUpdated(entry.clone())).map_err(IngestError::EventBus)?;
         } else {
-            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.insert_entry(entry.clone()).map_err(IngestError::StateStore)?;
+            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.bus.emit(Event::EntryInserted(entry.clone())).map_err(IngestError::EventBus)?;
         }
 
@@ -314,6 +317,24 @@ mod tests {
         }
     }
 
+    /// A state store whose writes always fail, simulating a poisoned lock.
+    #[derive(Default)]
+    struct FailingState;
+
+    impl StateStore for FailingState {
+        fn insert_entry(&self, _entry: Entry) -> Result<(), String> {
+            Err("state poisoned".to_string())
+        }
+
+        fn update_entry(&self, _entry: Entry) -> Result<(), String> {
+            Err("state poisoned".to_string())
+        }
+
+        fn get_entry(&self, _uuid: &str) -> Result<Option<Entry>, String> {
+            Ok(None)
+        }
+    }
+
     #[derive(Default)]
     struct TestBus {
         events: Mutex<Vec<Event>>,
@@ -434,6 +455,28 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[rstest]
+    fn ingest_state_failure_does_not_orphan_storage(
+        storage: TestStorage,
+        bus: TestBus,
+        envelope: Value,
+    ) {
+        let state = FailingState;
+        let ingestor = Ingestor::new(&state, &storage, &bus, || 42_000);
+
+        let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
+        assert_eq!(response.status, 500);
+
+        // Core state is updated before storage, so a state failure must leave no JSONL
+        // line behind (which would be invisible to live MCP/TUI until a restart) and
+        // emit no bus event.
+        assert!(
+            storage.entries.lock().unwrap().is_empty(),
+            "state failure must not append an orphaned storage entry"
+        );
+        assert!(bus.events.lock().unwrap().is_empty(), "no event should be emitted on failure");
     }
 
     #[rstest]
