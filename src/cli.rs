@@ -455,8 +455,26 @@ impl CoreStateStoreTrait for CoreState {
         filters: &Filters,
     ) -> Result<(Vec<CoreEntry>, usize), Self::Error> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
+        // When a scan window is bounded, take it from the *newest* entries (tail of
+        // `order`) so recent logs stay discoverable, then restore chronological order
+        // within the window so result/pagination ordering is unchanged.
+        let window: Vec<&CoreEntry> = match filters.scan_limit {
+            Some(scan_limit) => inner
+                .order
+                .iter()
+                .rev()
+                .filter_map(|uuid| inner.entries_by_uuid.get(uuid))
+                .take(scan_limit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            None => {
+                inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)).collect()
+            }
+        };
         let (matches, count) = filters
-            .apply_with_count(inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)))
+            .apply_with_count(window.into_iter())
             .map_err(|error| StateError::Filter(error.to_string()))?;
         Ok((matches.into_iter().cloned().collect(), count))
     }
@@ -2556,6 +2574,55 @@ mod tests {
             .and_then(|value| value.as_str())
             .expect("message");
         assert_eq!(message, "updated");
+    }
+
+    #[test]
+    fn list_entries_with_count_scan_window_covers_newest_entries() {
+        let core = CoreState::new(0);
+        let screen = Screen::new("proj:host:default");
+
+        for idx in 0..10u64 {
+            let uuid = format!("entry-{idx}");
+            let entry = CoreEntry {
+                uuid: uuid.clone(),
+                received_at: idx,
+                project: "proj".to_string(),
+                host: "host".to_string(),
+                screen: screen.clone(),
+                session_id: None,
+                payloads: vec![crate::raymon_core::Payload {
+                    r#type: "log".to_string(),
+                    content: serde_json::json!({ "message": uuid }),
+                    origin: crate::raymon_core::Origin {
+                        project: "proj".to_string(),
+                        host: "host".to_string(),
+                        screen: Some(screen.clone()),
+                        session_id: None,
+                        function_name: None,
+                        file: None,
+                        line_number: None,
+                    },
+                }],
+            };
+            core.insert(entry).expect("insert");
+        }
+
+        // Bounded scan window must cover the newest entries (tail of order), not the
+        // oldest, while preserving chronological order within the window.
+        let filters = Filters { scan_limit: Some(3), ..Default::default() };
+        let (entries, count) =
+            CoreStateStoreTrait::list_entries_with_count(&core, &filters).expect("list");
+        let uuids: Vec<String> = entries.into_iter().map(|entry| entry.uuid).collect();
+        assert_eq!(uuids, vec!["entry-7", "entry-8", "entry-9"]);
+        assert_eq!(count, 3);
+
+        // Without a scan window, all entries remain visible in chronological order.
+        let (all, all_count) =
+            CoreStateStoreTrait::list_entries_with_count(&core, &Filters::default()).expect("list");
+        assert_eq!(all.len(), 10);
+        assert_eq!(all_count, 10);
+        assert_eq!(all.first().expect("first").uuid, "entry-0");
+        assert_eq!(all.last().expect("last").uuid, "entry-9");
     }
 
     #[test]
