@@ -64,6 +64,7 @@ pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug)]
 enum UiEvent {
     Log(LogEntry),
+    UpdateLog(LogEntry),
     ClearScreen(String),
     ClearAll,
     Resync { dropped: usize, logs: Vec<LogEntry> },
@@ -1430,6 +1431,7 @@ fn run_tui_loop(
         while let Ok(event) = log_rx.try_recv() {
             match event {
                 UiEvent::Log(entry) => tui.push_log(entry),
+                UiEvent::UpdateLog(entry) => tui.update_log(entry),
                 UiEvent::ClearScreen(screen) => tui.clear_screen_for(Some(&screen)),
                 UiEvent::ClearAll => tui.clear_screen_for(None),
                 UiEvent::Resync { dropped, logs } => {
@@ -1567,19 +1569,25 @@ async fn forward_events_to_ui(
             }
             res = event_rx.recv() => match res {
                 Ok(event) => {
-                    let ui_event = match event {
-                        CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
-                            // Honor the clear epoch on the live path too: after Ctrl+l, an
-                            // update to a pre-clear UUID keeps its original received_at, so
-                            // without this guard it would repopulate the cleared list. Mirror
-                            // the resync filter so only post-clear or already-shown entries pass.
-                            if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
-                                seen_uuids.insert(entry.uuid.clone());
-                                Some(UiEvent::Log(log_entry_from_core(&entry)))
-                            } else {
-                                None
-                            }
+                    // Honor the clear epoch on the live path too: after Ctrl+l, an update
+                    // to a pre-clear UUID keeps its original received_at, so without this
+                    // guard it would repopulate the cleared list. Mirror the resync filter so
+                    // only post-clear or already-shown entries pass.
+                    let mut visible = |entry: &CoreEntry| -> bool {
+                        if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
+                            seen_uuids.insert(entry.uuid.clone());
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    let ui_event = match event {
+                        CoreEvent::EntryInserted(entry) => visible(&entry)
+                            .then(|| UiEvent::Log(log_entry_from_core(&entry))),
+                        // Updates upsert the existing row by UUID so re-ingested entries
+                        // refresh in place instead of appending a stale duplicate.
+                        CoreEvent::EntryUpdated(entry) => visible(&entry)
+                            .then(|| UiEvent::UpdateLog(log_entry_from_core(&entry))),
                         CoreEvent::ScreenCleared(screen) => {
                             Some(UiEvent::ClearScreen(screen.as_str().to_string()))
                         }

@@ -845,6 +845,17 @@ impl Tui {
     }
 
     pub fn push_log(&mut self, entry: LogEntry) {
+        self.push_log_inner(entry, false);
+    }
+
+    /// Apply an `EntryUpdated` event: refresh the existing row for this UUID in place
+    /// instead of appending a duplicate. Falls back to appending if no row exists yet
+    /// (e.g. the entry was never shown in this session).
+    pub fn update_log(&mut self, entry: LogEntry) {
+        self.push_log_inner(entry, true);
+    }
+
+    fn push_log_inner(&mut self, entry: LogEntry, is_update: bool) {
         self.record_event();
 
         let follow_tail = self.viewing_archive.is_none() && !self.state.paused && self.follow_tail;
@@ -856,6 +867,16 @@ impl Tui {
 
         if self.viewing_archive.is_some() {
             let live = self.live_buffer.get_or_insert_with(LiveBuffer::default);
+            if is_update {
+                if let Some(slot) = live.logs.iter_mut().find(|row| row.uuid == entry.uuid) {
+                    *slot = entry;
+                    return;
+                }
+                if let Some(slot) = live.queued.iter_mut().find(|row| row.uuid == entry.uuid) {
+                    *slot = entry;
+                    return;
+                }
+            }
             if self.state.paused {
                 live.queued.push(entry);
             } else {
@@ -869,6 +890,22 @@ impl Tui {
                 self.state.screens.push(screen.to_string());
             }
         }
+
+        // Core merges duplicate UUIDs into a single entry, so an update must replace the
+        // existing row rather than append a stale duplicate. Recompute the filter since the
+        // refreshed content may change its match status.
+        if is_update {
+            if let Some(slot) = self.state.logs.iter_mut().find(|row| row.uuid == entry.uuid) {
+                *slot = entry;
+                self.filter_dirty = true;
+                return;
+            }
+            if let Some(slot) = self.state.queued.iter_mut().find(|row| row.uuid == entry.uuid) {
+                *slot = entry;
+                return;
+            }
+        }
+
         if self.state.paused {
             self.state.queued.push(entry);
         } else {
@@ -5325,6 +5362,66 @@ mod tests {
 
         assert!(!tui.filter_dirty);
         assert_eq!(tui.state.filtered, vec![0]);
+    }
+
+    #[test]
+    fn update_log_upserts_existing_row_by_uuid() {
+        let (mut tui, _) = make_tui();
+        tui.state.active_screen = Some("main".to_string());
+
+        let uuid = "00000000-0000-0000-0000-000000000010".to_string();
+        tui.push_log(LogEntry {
+            id: 1,
+            uuid: uuid.clone(),
+            message: "first".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        });
+        assert_eq!(tui.state.logs.len(), 1);
+        assert_eq!(tui.state.filtered, vec![0]);
+
+        // Re-ingesting the same UUID merges in core and emits EntryUpdated; the TUI must
+        // refresh the existing row in place rather than append a stale duplicate.
+        tui.update_log(LogEntry {
+            id: 1,
+            uuid: uuid.clone(),
+            message: "merged".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        });
+        assert_eq!(tui.state.logs.len(), 1, "duplicate UUID must not add a row");
+        assert_eq!(tui.state.logs[0].message, "merged");
+        render_once(&mut tui);
+        assert_eq!(tui.state.filtered, vec![0]);
+
+        // An update for a UUID never shown in this session falls back to appending.
+        tui.update_log(LogEntry {
+            id: 2,
+            uuid: "00000000-0000-0000-0000-000000000011".to_string(),
+            message: "fresh".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(2_000),
+            entry_type: Some("log".to_string()),
+            color: Some("blue".to_string()),
+            screen: Some("main".to_string()),
+        });
+        assert_eq!(tui.state.logs.len(), 2);
+        assert_eq!(tui.state.logs[1].message, "fresh");
     }
 
     #[test]
