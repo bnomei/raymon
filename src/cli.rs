@@ -273,7 +273,7 @@ impl FileConfig {
             allow_insecure_remote: self.allow_insecure_remote,
             allow_mcp_shutdown: self.allow_mcp_shutdown,
             mcp_redact_payloads: self.mcp_redact_payloads,
-            auth_token: self.auth_token,
+            auth_token: self.auth_token.filter(|token| !token.trim().is_empty()),
         }
     }
 }
@@ -2355,6 +2355,29 @@ mod tests {
         fs::write(&path, "{not valid json").expect("write");
         let err = load_config_file(&path).unwrap_err();
         assert!(matches!(err, ConfigError::ParseFile { .. }));
+    }
+
+    #[test]
+    fn empty_file_auth_token_is_treated_as_unset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ray.json");
+        fs::write(&path, r#"{ "host": "0.0.0.0", "auth_token": "" }"#).expect("write");
+        let partial = load_config_file(&path).expect("load");
+        assert!(
+            partial.auth_token.is_none(),
+            "empty auth_token must not count as configured auth"
+        );
+
+        fs::write(&path, r#"{ "auth_token": "   " }"#).expect("write");
+        let partial = load_config_file(&path).expect("load");
+        assert!(
+            partial.auth_token.is_none(),
+            "whitespace-only auth_token must not count as configured auth"
+        );
+
+        fs::write(&path, r#"{ "auth_token": "secret" }"#).expect("write");
+        let partial = load_config_file(&path).expect("load");
+        assert_eq!(partial.auth_token.as_deref(), Some("secret"));
     }
 
     #[test]
