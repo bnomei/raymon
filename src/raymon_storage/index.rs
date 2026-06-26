@@ -29,14 +29,26 @@ pub(crate) struct Index {
 }
 
 impl Index {
-    pub(crate) fn record_count(&self) -> usize {
-        self.offsets.len()
+    /// Number of distinct entries (by UUID), not physical JSONL lines. Retention budgets
+    /// the count of distinct entries, so duplicate update lines for one UUID do not inflate
+    /// it and evict still-wanted entries.
+    pub(crate) fn distinct_entry_count(&self) -> usize {
+        self.order.len()
     }
 
-    pub(crate) fn tail_offsets(&self, keep: usize) -> Vec<(u64, u64)> {
-        let len = self.offsets.len();
+    /// Latest offset for each of the newest `keep` distinct entries (by first-seen order,
+    /// matching core-state eviction), returned in ascending file order so a rewrite keeps
+    /// one chronologically-ordered line per retained UUID.
+    pub(crate) fn tail_offsets_by_entry(&self, keep: usize) -> Vec<(u64, u64)> {
+        let len = self.order.len();
         let start = len.saturating_sub(keep);
-        self.offsets[start..].to_vec()
+        let mut offsets: Vec<(u64, u64)> = self.order[start..]
+            .iter()
+            .filter_map(|id| self.by_id.get(id))
+            .map(|record| (record.meta.offset, record.meta.len))
+            .collect();
+        offsets.sort_unstable_by_key(|(offset, _)| *offset);
+        offsets
     }
 
     pub(crate) fn insert(&mut self, record: IndexRecord) {
