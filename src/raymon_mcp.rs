@@ -1043,6 +1043,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_entries_tolerates_stray_commas_in_uuid_string() {
+        let store = TestStore {
+            entries: vec![sample_entry("entry-1"), sample_entry("entry-2")],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+
+        // Trailing, leading, and doubled commas leave empty segments that must be ignored
+        // rather than failing the whole batch.
+        let params: GetEntriesParams = serde_json::from_value(json!({
+            "uuids": ",entry-1,,entry-2,"
+        }))
+        .expect("get entries params should deserialize");
+
+        let result = handler.get_entries(Parameters(params)).await.expect("should not error");
+        let uuids = result.0.entries.into_iter().map(|entry| entry.uuid).collect::<Vec<_>>();
+
+        assert_eq!(uuids, vec!["entry-1", "entry-2"]);
+    }
+
+    #[tokio::test]
     async fn get_entries_returns_full_payloads_by_default() {
         let store = TestStore {
             entries: vec![sample_sensitive_entry("entry-sensitive")],

@@ -48,7 +48,13 @@ impl UuidSelector {
     pub(super) fn into_vec(self) -> Vec<String> {
         match self {
             Self::One(uuid) if uuid.contains(',') => {
-                uuid.split(',').map(compact_uuid_segment).collect()
+                // Drop empty segments from stray separators (leading/trailing/double commas)
+                // so the convenience form tolerates them, consistent with unknown UUIDs being
+                // silently skipped rather than failing the whole batch.
+                uuid.split(',')
+                    .map(compact_uuid_segment)
+                    .filter(|segment| !segment.is_empty())
+                    .collect()
             }
             Self::One(uuid) => vec![uuid.trim().to_string()],
             Self::Many(uuids) => uuids,
