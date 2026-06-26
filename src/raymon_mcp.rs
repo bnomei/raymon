@@ -472,10 +472,14 @@ where
         request: InitializeRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<InitializeResult, McpError> {
+        // Treat a repeat `initialize` on the same open connection as idempotent: register
+        // the peer only on the first one. Otherwise the same peer would be pushed onto
+        // `peers` again (prune_closed_peers keeps it since the transport is open), and the
+        // event forwarder would send every `ray/event` notification to that client twice.
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
+            self.register_peer(context.peer.clone()).await;
         }
-        self.register_peer(context.peer.clone()).await;
         Ok(self.get_info())
     }
 
