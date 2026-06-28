@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-28
+### Added
+- signal MCP clients with a `ray/event` lag notification when the event stream drops messages
+
+### Changed
+- serialize duplicate-UUID ingest merges and persist entries before exposing them in live state
+- refresh merged TUI rows in place and keep cleared live views from repopulating with stale updates
+- budget storage retention by distinct UUIDs rather than physical JSONL update lines
+- search the newest entries first for bounded MCP scans while preserving stable result ordering
+
+### Fixed
+- trim configured auth tokens from files and environment variables before comparing request tokens
+- tolerate stray separators in comma-separated `raymon.get_entries` UUID strings
+- report archive flush failures and remove truncated archive files on write errors
+
 ## [0.6.0] - 2026-06-17
 ### Added
 - document and test the MCP root fallback for JSON-RPC requests
