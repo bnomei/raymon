@@ -497,7 +497,7 @@ impl CoreStateStoreTrait for CoreState {
             None => inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)).collect(),
         };
         let (matches, count) = filters
-            .apply_with_count(window.into_iter())
+            .apply_with_count(window)
             .map_err(|error| StateError::Filter(error.to_string()))?;
         Ok((matches.into_iter().cloned().collect(), count))
     }
