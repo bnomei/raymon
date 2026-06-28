@@ -1,7 +1,7 @@
 //! HTTP ingest pipeline for Ray-compatible JSON envelopes.
 //!
-//! Parses inbound bodies, merges duplicate UUIDs, and commits to core state, durable storage,
-//! and the event bus in an order that keeps live queries consistent with persisted data.
+//! Parses inbound bodies, merges duplicate UUIDs, and commits to durable storage before updating
+//! core state and the event bus.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -208,15 +208,12 @@ where
         crate::sanitize::sanitize_entry(&mut entry);
         self.validate_entry_size(&entry)?;
 
-        // Core state before durable storage: a state failure must not leave orphaned JSONL lines
-        // that live MCP/TUI queries cannot see until restart.
+        self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
         if update {
             self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
-            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.bus.emit(Event::EntryUpdated(entry.clone())).map_err(IngestError::EventBus)?;
         } else {
             self.state.insert_entry(entry.clone()).map_err(IngestError::StateStore)?;
-            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.bus.emit(Event::EntryInserted(entry.clone())).map_err(IngestError::EventBus)?;
         }
 
@@ -337,6 +334,15 @@ mod tests {
         fn append_entry(&self, entry: &Entry) -> Result<(), String> {
             self.entries.lock().map_err(|_| "storage poisoned".to_string())?.push(entry.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingStorage;
+
+    impl Storage for FailingStorage {
+        fn append_entry(&self, _entry: &Entry) -> Result<(), String> {
+            Err("disk full".to_string())
         }
     }
 
@@ -528,7 +534,26 @@ mod tests {
     }
 
     #[rstest]
-    fn ingest_state_failure_does_not_orphan_storage(
+    fn ingest_storage_failure_does_not_mutate_state(
+        state: TestState,
+        bus: TestBus,
+        envelope: Value,
+    ) {
+        let storage = FailingStorage;
+        let ingestor = Ingestor::new(&state, &storage, &bus, || 42_000);
+
+        let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
+        assert_eq!(response.status, 500);
+
+        assert!(
+            state.entries.lock().unwrap().is_empty(),
+            "storage failure must not expose an unpersisted live entry"
+        );
+        assert!(bus.events.lock().unwrap().is_empty(), "no event should be emitted on failure");
+    }
+
+    #[rstest]
+    fn ingest_state_failure_does_not_emit_event(
         storage: TestStorage,
         bus: TestBus,
         envelope: Value,
@@ -539,10 +564,7 @@ mod tests {
         let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
         assert_eq!(response.status, 500);
 
-        assert!(
-            storage.entries.lock().unwrap().is_empty(),
-            "state failure must not append an orphaned storage entry"
-        );
+        assert_eq!(storage.entries.lock().unwrap().len(), 1);
         assert!(bus.events.lock().unwrap().is_empty(), "no event should be emitted on failure");
     }
 

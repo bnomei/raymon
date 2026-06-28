@@ -279,9 +279,14 @@ impl FileConfig {
             allow_insecure_remote: self.allow_insecure_remote,
             allow_mcp_shutdown: self.allow_mcp_shutdown,
             mcp_redact_payloads: self.mcp_redact_payloads,
-            auth_token: self.auth_token.filter(|token| !token.trim().is_empty()),
+            auth_token: self.auth_token.and_then(normalize_auth_token),
         }
     }
+}
+
+fn normalize_auth_token(token: String) -> Option<String> {
+    let trimmed = token.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1200,9 +1205,7 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
         partial.mcp_redact_payloads = Some(parse_bool("RAYMON_MCP_REDACT_PAYLOADS", value)?);
     }
     if let Some(value) = env.get("RAYMON_AUTH_TOKEN").or_else(|| env.get("RAYMON_TOKEN")) {
-        if !value.trim().is_empty() {
-            partial.auth_token = Some(value.clone());
-        }
+        partial.auth_token = normalize_auth_token(value.clone());
     }
     if let Some(no_tui) = env.get("RAYMON_NO_TUI") {
         let disabled = parse_bool("RAYMON_NO_TUI", no_tui)?;
@@ -2423,8 +2426,18 @@ mod tests {
             "whitespace-only auth_token must not count as configured auth"
         );
 
-        fs::write(&path, r#"{ "auth_token": "secret" }"#).expect("write");
+        fs::write(&path, r#"{ "auth_token": " secret " }"#).expect("write");
         let partial = load_config_file(&path).expect("load");
+        assert_eq!(partial.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn env_auth_token_is_trimmed() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("RAYMON_AUTH_TOKEN".to_string(), " secret ".to_string());
+
+        let partial = env_overrides(&env_map).expect("env overrides");
+
         assert_eq!(partial.auth_token.as_deref(), Some("secret"));
     }
 

@@ -906,8 +906,13 @@ impl Tui {
 
         // Core merges duplicate UUIDs; updates replace the existing row and may change filter match.
         if is_update {
+            let replacing_selected =
+                self.selected_entry().is_some_and(|selected| selected.uuid == entry.uuid);
             if let Some(slot) = self.state.logs.iter_mut().find(|row| row.uuid == entry.uuid) {
                 *slot = entry;
+                if replacing_selected {
+                    self.detail_cache = None;
+                }
                 self.filter_dirty = true;
                 return;
             }
@@ -5447,6 +5452,39 @@ mod tests {
         });
         assert_eq!(tui.state.logs.len(), 2);
         assert_eq!(tui.state.logs[1].message, "fresh");
+    }
+
+    #[test]
+    fn update_log_clears_detail_cache_when_selected_row_changes() {
+        let (mut tui, _) = make_tui();
+        let uuid = "00000000-0000-0000-0000-000000000010".to_string();
+        let mut entry = LogEntry {
+            id: 1,
+            uuid,
+            message: "first".to_string(),
+            detail: "old detail".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        };
+        tui.push_log(entry.clone());
+
+        {
+            let cached = tui.detail_cached();
+            assert_eq!(cached.blob_stats.bytes, "old detail".len());
+        }
+
+        entry.message = "merged".to_string();
+        entry.detail = "updated detail".to_string();
+        tui.update_log(entry);
+
+        assert!(tui.detail_cache.is_none(), "selected row replacement should invalidate detail");
+        let refreshed = tui.detail_cached();
+        assert_eq!(refreshed.blob_stats.bytes, "updated detail".len());
     }
 
     #[test]
