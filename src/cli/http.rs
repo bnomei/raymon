@@ -1,3 +1,8 @@
+//! Axum HTTP router for Ray ingest, MCP streamable HTTP, auth, and concurrency limits.
+//!
+//! Mounts `POST /` for Ray envelope ingest (with JSON-RPC fallback to `/mcp`) and `/mcp` for the
+//! MCP streamable HTTP service.
+
 use super::{AppState, CoreBus, CoreState, DynError, DEFAULT_MAX_CONCURRENCY};
 use crate::raymon_mcp::{RaymonMcp, RaymonMcpService};
 use axum::{
@@ -125,6 +130,7 @@ async fn ingest_or_mcp_handler(State(state): State<RouterState>, body: Bytes) ->
     };
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+    // Some clients POST JSON-RPC to `/` instead of `/mcp`; retry there when ingest rejects the body.
     if response.status == 422 && looks_like_mcp_request(&body) {
         let request = Request::builder()
             .method("POST")

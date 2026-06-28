@@ -1,7 +1,12 @@
+//! MCP tool request and response schemas for entry listing and retrieval.
+//!
+//! Types here are serialized for MCP clients and exported through JSON Schema.
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Parameters for the `raymon.search` MCP tool.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default)]
 pub struct ListEntriesParams {
@@ -15,6 +20,7 @@ pub struct ListEntriesParams {
     pub(super) offset: Option<usize>,
 }
 
+/// Facet filter input as either one comma-separated string or an explicit string list.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum StringListSelector {
@@ -37,6 +43,7 @@ impl StringListSelector {
     }
 }
 
+/// UUID batch input as one value, a comma-separated list, or an explicit UUID array.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum UuidSelector {
@@ -48,7 +55,11 @@ impl UuidSelector {
     pub(super) fn into_vec(self) -> Vec<String> {
         match self {
             Self::One(uuid) if uuid.contains(',') => {
-                uuid.split(',').map(compact_uuid_segment).collect()
+                // Ignore empty comma-separated segments so stray separators do not fail the batch.
+                uuid.split(',')
+                    .map(compact_uuid_segment)
+                    .filter(|segment| !segment.is_empty())
+                    .collect()
             }
             Self::One(uuid) => vec![uuid.trim().to_string()],
             Self::Many(uuids) => uuids,
@@ -56,6 +67,7 @@ impl UuidSelector {
     }
 }
 
+/// Parameters for the `raymon.get_entries` MCP tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetEntriesParams {
     #[serde(alias = "uuid")]
@@ -64,6 +76,7 @@ pub struct GetEntriesParams {
     pub(super) redact: bool,
 }
 
+/// Paginated search result returned by `raymon.search`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ListEntriesResult {
     pub(super) entries: Vec<EntrySummary>,
@@ -73,11 +86,13 @@ pub struct ListEntriesResult {
     pub(super) scan_limit: usize,
 }
 
+/// Full entry payloads returned by `raymon.get_entries`.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GetEntriesResult {
     pub(super) entries: Vec<McpEntry>,
 }
 
+/// Compact row shown in search results before a full entry fetch.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct EntrySummary {
     pub(super) uuid: String,
@@ -109,6 +124,7 @@ impl From<crate::raymon_core::Entry> for EntrySummary {
     }
 }
 
+/// Full entry shape exposed to MCP clients, optionally with redacted payloads.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct McpEntry {
     pub(super) uuid: String,
@@ -144,6 +160,7 @@ impl McpEntry {
     }
 }
 
+/// Single payload item in an MCP entry response.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct McpPayload {
     pub(super) r#type: String,
@@ -168,6 +185,7 @@ impl McpPayload {
     }
 }
 
+/// Origin metadata attached to an MCP payload.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct McpOrigin {
     pub(super) project: String,

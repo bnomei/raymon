@@ -1,4 +1,6 @@
-//! Ratatui interface for Raymon.
+//! Terminal UI for browsing live and archived Ray logs with search, filters, and detail panes.
+//!
+//! Mirrors core entry merges by refreshing rows in place when a UUID is re-ingested.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -55,6 +57,7 @@ pub enum Mode {
     Picker,
 }
 
+/// Which main pane receives keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
     Logs,
@@ -62,12 +65,14 @@ pub enum FocusPane {
     Archives,
 }
 
+/// Help overlay content: space cheatsheet or full keymap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpMode {
     Space,
     Keymap,
 }
 
+/// Facet picker currently open in [`Mode::Picker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     Screens,
@@ -75,6 +80,7 @@ pub enum PickerKind {
     Types,
 }
 
+/// Stable identifier for a row in a facet picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerItemId {
     Screen(String),
@@ -85,6 +91,7 @@ pub enum PickerItemId {
     ClearScreens,
 }
 
+/// One selectable row in a facet picker.
 #[derive(Debug, Clone)]
 pub struct PickerItem {
     pub label: String,
@@ -93,6 +100,7 @@ pub struct PickerItem {
     pub active: bool,
 }
 
+/// Fuzzy-filtered facet picker state.
 #[derive(Debug, Clone)]
 pub struct PickerState {
     pub kind: PickerKind,
@@ -152,6 +160,7 @@ impl PickerState {
     }
 }
 
+/// Active type and color facet filters applied to the log list.
 #[derive(Debug, Clone, Default)]
 pub struct FilterState {
     pub types: BTreeSet<String>,
@@ -206,6 +215,7 @@ impl InputState {
     }
 }
 
+/// In-progress archive rename prompt state.
 #[derive(Debug, Clone)]
 pub struct RenameArchiveState {
     pub path: PathBuf,
@@ -213,6 +223,7 @@ pub struct RenameArchiveState {
     pub overwrite: bool,
 }
 
+/// Custom 16-color terminal palette for log rendering.
 #[derive(Debug, Clone)]
 pub struct TuiPalette {
     pub fg: Color,
@@ -681,6 +692,7 @@ impl Tui {
         (logs, detail, archives)
     }
 
+    /// Create a TUI with the system clipboard and archive directory from `config`.
     pub fn new(config: TuiConfig) -> Self {
         let state =
             TuiState { show_archives: config.show_archives_by_default, ..Default::default() };
@@ -705,6 +717,7 @@ impl Tui {
         tui
     }
 
+    /// Create a TUI with a custom clipboard backend (useful in tests).
     pub fn with_clipboard(config: TuiConfig, clipboard: Box<dyn Clipboard>) -> Self {
         let state =
             TuiState { show_archives: config.show_archives_by_default, ..Default::default() };
@@ -729,6 +742,7 @@ impl Tui {
         tui
     }
 
+    /// Replace the live log list after an event-bus resync or clear epoch change.
     pub fn resync_live_logs(&mut self, logs: Vec<LogEntry>, notice: String) {
         if self.viewing_archive.is_some() {
             let live = self.live_buffer.get_or_insert_with(LiveBuffer::default);
@@ -844,7 +858,17 @@ impl Tui {
             self.state.archive_selected.min(self.state.archives.len().saturating_sub(1));
     }
 
+    /// Append a new log row from an `EntryInserted` event.
     pub fn push_log(&mut self, entry: LogEntry) {
+        self.push_log_inner(entry, false);
+    }
+
+    /// Refresh an existing log row by UUID after a core merge, or append if the row is new.
+    pub fn update_log(&mut self, entry: LogEntry) {
+        self.push_log_inner(entry, true);
+    }
+
+    fn push_log_inner(&mut self, entry: LogEntry, is_update: bool) {
         self.record_event();
 
         let follow_tail = self.viewing_archive.is_none() && !self.state.paused && self.follow_tail;
@@ -856,6 +880,16 @@ impl Tui {
 
         if self.viewing_archive.is_some() {
             let live = self.live_buffer.get_or_insert_with(LiveBuffer::default);
+            if is_update {
+                if let Some(slot) = live.logs.iter_mut().find(|row| row.uuid == entry.uuid) {
+                    *slot = entry;
+                    return;
+                }
+                if let Some(slot) = live.queued.iter_mut().find(|row| row.uuid == entry.uuid) {
+                    *slot = entry;
+                    return;
+                }
+            }
             if self.state.paused {
                 live.queued.push(entry);
             } else {
@@ -869,6 +903,25 @@ impl Tui {
                 self.state.screens.push(screen.to_string());
             }
         }
+
+        // Core merges duplicate UUIDs; updates replace the existing row and may change filter match.
+        if is_update {
+            let replacing_selected =
+                self.selected_entry().is_some_and(|selected| selected.uuid == entry.uuid);
+            if let Some(slot) = self.state.logs.iter_mut().find(|row| row.uuid == entry.uuid) {
+                *slot = entry;
+                if replacing_selected {
+                    self.detail_cache = None;
+                }
+                self.filter_dirty = true;
+                return;
+            }
+            if let Some(slot) = self.state.queued.iter_mut().find(|row| row.uuid == entry.uuid) {
+                *slot = entry;
+                return;
+            }
+        }
+
         if self.state.paused {
             self.state.queued.push(entry);
         } else {
@@ -968,10 +1021,12 @@ impl Tui {
         });
     }
 
+    /// Mutable access to the archives list for host-driven refresh.
     pub fn archives_mut(&mut self) -> &mut Vec<ArchiveFile> {
         &mut self.state.archives
     }
 
+    /// Currently selected log row in the filtered list, if any.
     pub fn selected_entry(&self) -> Option<&LogEntry> {
         let idx = *self.state.filtered.get(self.state.selected)?;
         self.state.logs.get(idx)
@@ -1078,6 +1133,7 @@ impl Tui {
         };
     }
 
+    /// Handle a keyboard event and return any side-effect action for the host to run.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -1146,6 +1202,7 @@ impl Tui {
         }
     }
 
+    /// Handle a mouse event against the current layout and return any side-effect action.
     pub fn handle_mouse(&mut self, event: MouseEvent, size: Rect) -> Action {
         if self.state.picker.is_some()
             || self.state.delete_archive_confirm.is_some()
@@ -1315,6 +1372,7 @@ impl Tui {
         Action::None
     }
 
+    /// Execute a host-requested [`Action`] such as opening an editor or quitting.
     pub fn perform_action(&mut self, action: Action) -> Result<ActionOutcome, TuiError> {
         match action {
             Action::None => Err(TuiError::InvalidCommandLine("no action".to_string())),
@@ -1333,6 +1391,7 @@ impl Tui {
         }
     }
 
+    /// Draw the current TUI state into a ratatui frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         if self.filter_dirty {
             self.recompute_filter();
@@ -1490,6 +1549,7 @@ impl Tui {
         Text::from(text_lines)
     }
 
+    /// Switch to search mode and focus the query input.
     pub fn enter_search(&mut self) {
         self.state.mode = Mode::Search;
         self.state.detail_notice = None;
@@ -1505,6 +1565,7 @@ impl Tui {
         )
     }
 
+    /// Switch to command mode for `:`-prefixed actions.
     pub fn enter_command(&mut self) {
         self.state.mode = Mode::Command;
         self.state.command.clear();
@@ -1670,6 +1731,7 @@ impl Tui {
         }
     }
 
+    /// Search the selected entry detail pane by plain text, JSON path, or jq.
     pub fn search_detail(&mut self, query: &str) -> DetailSearchResult {
         self.state.detail_notice = None;
         let detail = match self.selected_entry() {
@@ -2351,6 +2413,7 @@ impl Tui {
         self.scroll_detail_by(direction.saturating_mul(step));
     }
 
+    /// Drop log rows for one screen or all screens when `screen` is `None`.
     pub fn clear_screen_for(&mut self, screen: Option<&str>) {
         let (logs, queued) = if self.viewing_archive.is_some() {
             let live = self.live_buffer.get_or_insert_with(LiveBuffer::default);
@@ -2521,7 +2584,13 @@ impl Tui {
                 }
             }
         }
-        let _ = writer.flush();
+        // Flush failure leaves a truncated file; remove it instead of reporting a false success count.
+        if let Err(err) = writer.flush() {
+            drop(writer);
+            let _ = std::fs::remove_file(&path);
+            self.state.detail_notice = Some(format!("archive failed: {err}"));
+            return;
+        }
 
         if written == 0 {
             self.state.detail_notice = Some("archive produced no entries".to_string());
@@ -4469,6 +4538,7 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool
     false
 }
 
+/// Rank picker items by fuzzy match score; returns indices in best-match order.
 pub fn fuzzy_rank_items(items: &[PickerItem], query: &str) -> Vec<usize> {
     let query_lower = query.to_lowercase();
     let threshold = if query_lower.len() <= 2 { 0.2 } else { 0.35 };
@@ -5328,6 +5398,96 @@ mod tests {
     }
 
     #[test]
+    fn update_log_upserts_existing_row_by_uuid() {
+        let (mut tui, _) = make_tui();
+        tui.state.active_screen = Some("main".to_string());
+
+        let uuid = "00000000-0000-0000-0000-000000000010".to_string();
+        tui.push_log(LogEntry {
+            id: 1,
+            uuid: uuid.clone(),
+            message: "first".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        });
+        assert_eq!(tui.state.logs.len(), 1);
+        assert_eq!(tui.state.filtered, vec![0]);
+
+        tui.update_log(LogEntry {
+            id: 1,
+            uuid: uuid.clone(),
+            message: "merged".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        });
+        assert_eq!(tui.state.logs.len(), 1, "duplicate UUID must not add a row");
+        assert_eq!(tui.state.logs[0].message, "merged");
+        render_once(&mut tui);
+        assert_eq!(tui.state.filtered, vec![0]);
+
+        tui.update_log(LogEntry {
+            id: 2,
+            uuid: "00000000-0000-0000-0000-000000000011".to_string(),
+            message: "fresh".to_string(),
+            detail: "{}".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(2_000),
+            entry_type: Some("log".to_string()),
+            color: Some("blue".to_string()),
+            screen: Some("main".to_string()),
+        });
+        assert_eq!(tui.state.logs.len(), 2);
+        assert_eq!(tui.state.logs[1].message, "fresh");
+    }
+
+    #[test]
+    fn update_log_clears_detail_cache_when_selected_row_changes() {
+        let (mut tui, _) = make_tui();
+        let uuid = "00000000-0000-0000-0000-000000000010".to_string();
+        let mut entry = LogEntry {
+            id: 1,
+            uuid,
+            message: "first".to_string(),
+            detail: "old detail".to_string(),
+            origin: None,
+            origin_file: None,
+            origin_line: None,
+            timestamp: Some(1_000),
+            entry_type: Some("log".to_string()),
+            color: Some("red".to_string()),
+            screen: Some("main".to_string()),
+        };
+        tui.push_log(entry.clone());
+
+        {
+            let cached = tui.detail_cached();
+            assert_eq!(cached.blob_stats.bytes, "old detail".len());
+        }
+
+        entry.message = "merged".to_string();
+        entry.detail = "updated detail".to_string();
+        tui.update_log(entry);
+
+        assert!(tui.detail_cache.is_none(), "selected row replacement should invalidate detail");
+        let refreshed = tui.detail_cached();
+        assert_eq!(refreshed.blob_stats.bytes, "updated detail".len());
+    }
+
+    #[test]
     fn push_log_marks_filter_dirty_and_recomputes_on_render() {
         let (mut tui, _) = make_tui();
         seed_logs(&mut tui);
@@ -6001,6 +6161,42 @@ mod tests {
         }
 
         assert!(fs::metadata(&live_path).expect("metadata").len() > 0);
+    }
+
+    #[test]
+    fn archive_current_view_writes_and_counts_entries() {
+        let dir = tempdir().expect("tempdir");
+        let config =
+            TuiConfig { archive_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let value = Arc::new(Mutex::new(String::new()));
+        let clipboard = MockClipboard { value };
+        let mut tui = Tui::with_clipboard(config, Box::new(clipboard));
+
+        for i in 0..3u64 {
+            tui.push_log(LogEntry {
+                id: i,
+                uuid: format!("uuid-{i}"),
+                message: format!("message-{i}"),
+                detail: "{}".to_string(),
+                origin: None,
+                origin_file: None,
+                origin_line: None,
+                timestamp: Some(1_000 + i),
+                entry_type: Some("log".to_string()),
+                color: None,
+                screen: Some("main".to_string()),
+            });
+        }
+        tui.recompute_filter();
+        assert_eq!(tui.state.filtered.len(), 3);
+
+        tui.archive_current_view();
+
+        let archive =
+            tui.state.archives.iter().find(|archive| !archive.live).expect("archive registered");
+        assert_eq!(archive.count, 3);
+        let contents = std::fs::read_to_string(&archive.path).expect("read archive");
+        assert_eq!(contents.lines().count(), 3);
     }
 
     #[rstest]

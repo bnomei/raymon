@@ -1,4 +1,7 @@
-//! HTTP ingest handlers for Raymon.
+//! HTTP ingest pipeline for Ray-compatible JSON envelopes.
+//!
+//! Parses inbound bodies, merges duplicate UUIDs, and commits to durable storage before updating
+//! core state and the event bus.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,6 +62,13 @@ impl IngestError {
     }
 }
 
+/// Held across the read-modify-write merge of one UUID so concurrent same-UUID ingests cannot
+/// lose payloads via last-writer-wins. The default [`StateStore::ingest_guard`] is a no-op.
+pub enum IngestGuard<'a> {
+    Noop,
+    Locked(std::sync::MutexGuard<'a, ()>),
+}
+
 /// Minimal state-store API needed by [`Ingestor`].
 ///
 /// This trait exists to keep the ingest pipeline decoupled from concrete storage/state
@@ -67,6 +77,13 @@ pub trait StateStore {
     fn insert_entry(&self, entry: Entry) -> Result<(), String>;
     fn update_entry(&self, entry: Entry) -> Result<(), String>;
     fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String>;
+
+    /// Serialize the read-modify-write merge of `uuid`. Multi-writer stores must return a real
+    /// guard; the default is a no-op for single-writer test doubles.
+    fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
+        let _ = uuid;
+        IngestGuard::Noop
+    }
 }
 
 impl<T> StateStore for &T
@@ -83,6 +100,10 @@ where
 
     fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String> {
         (*self).get_entry(uuid)
+    }
+
+    fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
+        (*self).ingest_guard(uuid)
     }
 }
 
@@ -172,6 +193,9 @@ where
 
         let mut entry = envelope.into_entry((self.clock)());
 
+        // Held through get_entry and commit so same-UUID ingests cannot interleave merges.
+        let _ingest_guard = self.state.ingest_guard(&entry.uuid);
+
         let existing = self.state.get_entry(&entry.uuid).map_err(IngestError::StateStore)?;
 
         let update = if let Some(existing) = existing {
@@ -184,12 +208,11 @@ where
         crate::sanitize::sanitize_entry(&mut entry);
         self.validate_entry_size(&entry)?;
 
+        self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
         if update {
-            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.update_entry(entry.clone()).map_err(IngestError::StateStore)?;
             self.bus.emit(Event::EntryUpdated(entry.clone())).map_err(IngestError::EventBus)?;
         } else {
-            self.storage.append_entry(&entry).map_err(IngestError::Storage)?;
             self.state.insert_entry(entry.clone()).map_err(IngestError::StateStore)?;
             self.bus.emit(Event::EntryInserted(entry.clone())).map_err(IngestError::EventBus)?;
         }
@@ -311,6 +334,80 @@ mod tests {
         fn append_entry(&self, entry: &Entry) -> Result<(), String> {
             self.entries.lock().map_err(|_| "storage poisoned".to_string())?.push(entry.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingStorage;
+
+    impl Storage for FailingStorage {
+        fn append_entry(&self, _entry: &Entry) -> Result<(), String> {
+            Err("disk full".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingState;
+
+    impl StateStore for FailingState {
+        fn insert_entry(&self, _entry: Entry) -> Result<(), String> {
+            Err("state poisoned".to_string())
+        }
+
+        fn update_entry(&self, _entry: Entry) -> Result<(), String> {
+            Err("state poisoned".to_string())
+        }
+
+        fn get_entry(&self, _uuid: &str) -> Result<Option<Entry>, String> {
+            Ok(None)
+        }
+    }
+
+    struct SharedConcurrentState {
+        entries: std::sync::Mutex<Vec<Entry>>,
+        locks: [std::sync::Mutex<()>; 16],
+        get_delay: std::time::Duration,
+    }
+
+    impl SharedConcurrentState {
+        fn new(get_delay: std::time::Duration) -> Self {
+            Self {
+                entries: std::sync::Mutex::new(Vec::new()),
+                locks: std::array::from_fn(|_| std::sync::Mutex::new(())),
+                get_delay,
+            }
+        }
+    }
+
+    impl StateStore for SharedConcurrentState {
+        fn insert_entry(&self, entry: Entry) -> Result<(), String> {
+            self.entries.lock().map_err(|_| "poisoned".to_string())?.push(entry);
+            Ok(())
+        }
+
+        fn update_entry(&self, entry: Entry) -> Result<(), String> {
+            let mut guard = self.entries.lock().map_err(|_| "poisoned".to_string())?;
+            if let Some(existing) = guard.iter_mut().find(|item| item.uuid == entry.uuid) {
+                *existing = entry;
+            } else {
+                guard.push(entry);
+            }
+            Ok(())
+        }
+
+        fn get_entry(&self, uuid: &str) -> Result<Option<Entry>, String> {
+            std::thread::sleep(self.get_delay);
+            let guard = self.entries.lock().map_err(|_| "poisoned".to_string())?;
+            Ok(guard.iter().find(|entry| entry.uuid == uuid).cloned())
+        }
+
+        fn ingest_guard(&self, uuid: &str) -> IngestGuard<'_> {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(uuid, &mut hasher);
+            let shard = (std::hash::Hasher::finish(&hasher) as usize) % self.locks.len();
+            IngestGuard::Locked(
+                self.locks[shard].lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
         }
     }
 
@@ -437,6 +534,41 @@ mod tests {
     }
 
     #[rstest]
+    fn ingest_storage_failure_does_not_mutate_state(
+        state: TestState,
+        bus: TestBus,
+        envelope: Value,
+    ) {
+        let storage = FailingStorage;
+        let ingestor = Ingestor::new(&state, &storage, &bus, || 42_000);
+
+        let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
+        assert_eq!(response.status, 500);
+
+        assert!(
+            state.entries.lock().unwrap().is_empty(),
+            "storage failure must not expose an unpersisted live entry"
+        );
+        assert!(bus.events.lock().unwrap().is_empty(), "no event should be emitted on failure");
+    }
+
+    #[rstest]
+    fn ingest_state_failure_does_not_emit_event(
+        storage: TestStorage,
+        bus: TestBus,
+        envelope: Value,
+    ) {
+        let state = FailingState;
+        let ingestor = Ingestor::new(&state, &storage, &bus, || 42_000);
+
+        let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
+        assert_eq!(response.status, 500);
+
+        assert_eq!(storage.entries.lock().unwrap().len(), 1);
+        assert!(bus.events.lock().unwrap().is_empty(), "no event should be emitted on failure");
+    }
+
+    #[rstest]
     fn ingest_duplicate_uuid_updates_state(
         state: TestState,
         storage: TestStorage,
@@ -464,6 +596,44 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::EntryInserted(_)));
         assert!(matches!(events[1], Event::EntryUpdated(_)));
+    }
+
+    #[test]
+    fn concurrent_same_uuid_ingest_preserves_all_payloads() {
+        const N: usize = 8;
+        let state = SharedConcurrentState::new(std::time::Duration::from_millis(5));
+        let storage = TestStorage::default();
+        let bus = TestBus::default();
+
+        std::thread::scope(|scope| {
+            for i in 0..N {
+                let state = &state;
+                let storage = &storage;
+                let bus = &bus;
+                scope.spawn(move || {
+                    let ingestor = Ingestor::new(state, storage, bus, || 42_000);
+                    let envelope = json!({
+                        "uuid": "shared-uuid",
+                        "payloads": [{
+                            "type": "log",
+                            "content": { "message": format!("payload-{i}") },
+                            "origin": { "hostname": "device" }
+                        }],
+                        "meta": { "project": "ray", "host": "device" }
+                    });
+                    let response = ingestor.handle(&serde_json::to_vec(&envelope).unwrap());
+                    assert_eq!(response.status, 200);
+                });
+            }
+        });
+
+        let entries = state.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "all ingests target the same UUID");
+        assert_eq!(
+            entries[0].payloads.len(),
+            N,
+            "concurrent same-UUID merges must not drop payloads"
+        );
     }
 
     #[rstest]

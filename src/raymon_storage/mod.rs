@@ -3,7 +3,7 @@
 //! Entries are persisted as newline-delimited JSON (`.jsonl`) on disk and indexed in-memory for
 //! fast listing and random access by id/offset.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -142,6 +142,7 @@ impl EntryFilter {
     }
 }
 
+/// Append-only JSONL entry store with an in-memory index for listing and offset lookup.
 pub struct Storage {
     root: PathBuf,
     data_dir: PathBuf,
@@ -274,12 +275,12 @@ impl Storage {
             return Ok(None);
         }
         let slack = retention_slack(max_entries);
-        let total = self.index.record_count();
+        let total = self.index.distinct_entry_count();
         if total <= max_entries.saturating_add(slack) {
             return Ok(None);
         }
 
-        let offsets = self.index.tail_offsets(max_entries);
+        let offsets = self.index.tail_offsets_by_entry(max_entries);
         rewrite_retained_offsets(&self.entries_path, &offsets)?;
         self.rebuild_index()?;
 
@@ -299,25 +300,29 @@ fn enforce_retention(
         return Ok(None);
     }
 
-    let mut offsets: VecDeque<(u64, u64)> = VecDeque::new();
-    let mut total = 0usize;
-    jsonl::scan_entries(entries_path, |offset, len, _entry| {
-        total = total.saturating_add(1);
-        offsets.push_back((offset, len));
-        if offsets.len() > retention_max_entries {
-            offsets.pop_front();
+    // Budget retention by distinct UUID, keeping the newest `N` entries (one line each).
+    let mut latest: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    jsonl::scan_entries(entries_path, |offset, len, entry| {
+        if !latest.contains_key(&entry.id) {
+            order.push(entry.id.clone());
         }
+        latest.insert(entry.id.clone(), (offset, len));
     })?;
 
-    if total <= retention_max_entries {
+    let distinct = order.len();
+    if distinct <= retention_max_entries {
         return Ok(None);
     }
 
-    let offsets: Vec<(u64, u64)> = offsets.into_iter().collect();
+    let start = distinct - retention_max_entries;
+    let mut offsets: Vec<(u64, u64)> =
+        order[start..].iter().filter_map(|id| latest.get(id).copied()).collect();
+    offsets.sort_unstable_by_key(|(offset, _)| *offset);
     rewrite_retained_offsets(entries_path, &offsets)?;
 
     Ok(Some(RetentionOutcome {
-        dropped: total.saturating_sub(retention_max_entries),
+        dropped: distinct.saturating_sub(retention_max_entries),
         kept: retention_max_entries,
     }))
 }
@@ -495,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_counts_duplicate_ids_on_append() {
+    fn retention_does_not_count_duplicate_ids_against_budget() {
         let dir = TempDir::new().expect("temp dir");
         let mut storage = Storage::new_with_retention(dir.path(), 2).expect("storage");
 
@@ -517,13 +522,52 @@ mod tests {
 
         let entries_path = dir.path().join(DEFAULT_DATA_DIR).join(ENTRIES_FILE);
         let jsonl = std::fs::read_to_string(entries_path).expect("read entries");
-        assert_eq!(jsonl.lines().count(), 2);
+        assert_eq!(jsonl.lines().count(), 4);
 
         let listed = storage.list_entries(None);
         assert_eq!(listed.len(), 1);
 
         let entry = storage.get_entry_by_id("entry-1").expect("get entry").expect("missing entry");
         assert_eq!(entry.summary, "entry-4");
+    }
+
+    #[test]
+    fn retention_keeps_distinct_entries_at_cap_despite_updates() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut storage = Storage::new_with_retention(dir.path(), 2).expect("storage");
+
+        let append = |storage: &mut Storage, id: &str, version: u32| {
+            let input = EntryInput {
+                id: id.to_string(),
+                project: "proj".to_string(),
+                host: "host".to_string(),
+                screen: "home".to_string(),
+                session: "sess-a".to_string(),
+                summary: format!("{id}-v{version}"),
+                search_text: format!("{id}-v{version}"),
+                types: Vec::new(),
+                colors: Vec::new(),
+                payload: EntryPayload::Text(format!("{id}-payload-{version}")),
+            };
+            storage.append_entry(input).expect("append entry");
+        };
+
+        append(&mut storage, "entry-a", 1);
+        append(&mut storage, "entry-a", 2);
+        append(&mut storage, "entry-b", 1);
+        append(&mut storage, "entry-b", 2);
+
+        let a = storage.get_entry_by_id("entry-a").expect("get a").expect("entry-a missing");
+        assert_eq!(a.summary, "entry-a-v2");
+        let b = storage.get_entry_by_id("entry-b").expect("get b").expect("entry-b missing");
+        assert_eq!(b.summary, "entry-b-v2");
+
+        drop(storage);
+        let reloaded = Storage::new_with_retention(dir.path(), 2).expect("reload");
+        let ids: std::collections::HashSet<String> =
+            reloaded.list_entries(None).into_iter().map(|meta| meta.id.to_string()).collect();
+        assert!(ids.contains("entry-a"), "entry-a must survive reload");
+        assert!(ids.contains("entry-b"), "entry-b must survive reload");
     }
 
     #[rstest]

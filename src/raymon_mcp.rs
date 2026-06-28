@@ -1,4 +1,6 @@
-//! MCP handlers for Raymon using rmcp.
+//! MCP server for Raymon: entry search tools and live `ray/event` notifications over rmcp.
+//!
+//! Forwards core [`Event`]s to connected peers and surfaces subscription lag so clients can resync.
 
 use std::any::Any;
 use std::fmt::Display;
@@ -34,7 +36,7 @@ pub use schema::{
     McpEntry, McpOrigin, McpPayload, StringListSelector, UuidSelector,
 };
 
-/// Streamable HTTP service type for mounting on `/mcp` with axum/tower.
+/// Streamable HTTP MCP service mounted at `/mcp` behind axum or tower.
 pub type RaymonMcpService<S, B> = StreamableHttpService<RaymonMcp<S, B>, LocalSessionManager>;
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -60,6 +62,7 @@ fn prune_closed_peers<P: PeerHealth>(peers: &mut Vec<P>) {
     peers.retain(|peer| !peer.transport_closed());
 }
 
+// Drop the oldest peers when the cap is exceeded so the forwarder stays bounded.
 fn enforce_peer_cap<P>(peers: &mut Vec<P>, cap: usize) {
     if cap == 0 {
         peers.clear();
@@ -83,28 +86,37 @@ pub enum McpInitError {
     NoRuntime,
 }
 
-/// Trait for event subscriptions that can be awaited inside the MCP server.
+/// Event-stream item for the MCP forwarder. `Lagged` exposes dropped notifications so peers can
+/// resync via `raymon.search` instead of silently missing entries.
+pub enum StreamMessage {
+    Event(Event),
+    Lagged(u64),
+}
+
+/// Async event subscription used by the MCP notification forwarder.
+///
+/// Implementations must surface broadcast lag as [`StreamMessage::Lagged`] rather than dropping it.
 pub trait EventStream: Send + 'static {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + 'a>>;
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>>;
 }
 
 impl EventStream for broadcast::Receiver<Event> {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + 'a>> {
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>> {
         Box::pin(async move {
-            loop {
-                match self.recv().await {
-                    Ok(event) => return Some(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
+            match self.recv().await {
+                Ok(event) => Some(StreamMessage::Event(event)),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    Some(StreamMessage::Lagged(skipped))
                 }
+                Err(broadcast::error::RecvError::Closed) => None,
             }
         })
     }
 }
 
 impl EventStream for mpsc::Receiver<Event> {
-    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<Event>> + Send + 'a>> {
-        Box::pin(async move { self.recv().await })
+    fn recv<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Option<StreamMessage>> + Send + 'a>> {
+        Box::pin(async move { self.recv().await.map(StreamMessage::Event) })
     }
 }
 
@@ -179,6 +191,7 @@ where
         }
     }
 
+    /// Spawn the task that forwards core events and lag signals to connected MCP peers.
     pub fn start_event_forwarder(&self) -> Result<(), McpInitError> {
         if self.forwarder_started.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -191,8 +204,11 @@ where
         let handle = tokio::runtime::Handle::try_current().map_err(|_| McpInitError::NoRuntime)?;
 
         handle.spawn(async move {
-            while let Some(event) = subscription.recv().await {
-                let notification = event_to_notification(event, redact_payloads);
+            while let Some(message) = subscription.recv().await {
+                let notification = match message {
+                    StreamMessage::Event(event) => event_to_notification(event, redact_payloads),
+                    StreamMessage::Lagged(skipped) => lagged_notification(skipped),
+                };
                 broadcast_notification(&peers, notification).await;
             }
         });
@@ -200,6 +216,7 @@ where
         Ok(())
     }
 
+    /// Build a streamable HTTP MCP service with default configuration.
     pub fn streamable_http_service(
         state: S,
         bus: B,
@@ -207,6 +224,7 @@ where
         Self::streamable_http_service_with_config(state, bus, StreamableHttpServerConfig::default())
     }
 
+    /// Build a streamable HTTP MCP service wired to a process shutdown channel.
     pub fn streamable_http_service_with_shutdown(
         state: S,
         bus: B,
@@ -221,6 +239,7 @@ where
         ))
     }
 
+    /// Build a streamable HTTP MCP service with shutdown wiring and a query-length cap.
     pub fn streamable_http_service_with_shutdown_and_limits(
         state: S,
         bus: B,
@@ -236,6 +255,7 @@ where
         ))
     }
 
+    /// Like [`Self::streamable_http_service_with_shutdown_and_limits`] with optional shutdown tools.
     pub fn streamable_http_service_with_shutdown_and_limits_and_shutdown_methods(
         state: S,
         bus: B,
@@ -253,6 +273,7 @@ where
         )
     }
 
+    /// Full CLI factory: shutdown wiring, query cap, optional shutdown tools, and payload redaction.
     pub fn streamable_http_service_with_shutdown_and_limits_and_shutdown_methods_and_payload_redaction(
         state: S,
         bus: B,
@@ -272,6 +293,7 @@ where
         ))
     }
 
+    /// Build a streamable HTTP MCP service with custom rmcp transport configuration.
     pub fn streamable_http_service_with_config(
         state: S,
         bus: B,
@@ -289,11 +311,13 @@ where
         enforce_peer_cap(&mut peers, MAX_MCP_PEERS);
     }
 
+    /// Allow MCP clients to invoke process shutdown tools.
     pub fn with_shutdown_methods(mut self, allow_shutdown_methods: bool) -> Self {
         self.allow_shutdown_methods = allow_shutdown_methods;
         self
     }
 
+    /// Redact sensitive payload fields in MCP tool results and `ray/event` notifications.
     pub fn with_payload_redaction(mut self, redact_payloads: bool) -> Self {
         self.redact_payloads = redact_payloads;
         self
@@ -457,10 +481,12 @@ where
         request: InitializeRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<InitializeResult, McpError> {
+        // Repeat initialize on one connection is idempotent: register the peer only once so the
+        // forwarder does not deliver duplicate `ray/event` notifications.
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
+            self.register_peer(context.peer.clone()).await;
         }
-        self.register_peer(context.peer.clone()).await;
         Ok(self.get_info())
     }
 
@@ -641,6 +667,12 @@ fn event_to_notification(event: Event, redact_payloads: bool) -> ServerNotificat
         Event::ScreenCleared(screen) => json!({ "type": "screen_cleared", "screen": screen }),
         Event::StateCleared => json!({ "type": "state_cleared" }),
     };
+    ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
+}
+
+/// `ray/event` notification telling clients the subscription lagged and they should refresh.
+fn lagged_notification(skipped: u64) -> ServerNotification {
+    let payload = json!({ "type": "lagged", "dropped": skipped });
     ServerNotification::CustomNotification(CustomNotification::new("ray/event", Some(payload)))
 }
 
@@ -1015,6 +1047,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_entries_tolerates_stray_commas_in_uuid_string() {
+        let store = TestStore {
+            entries: vec![sample_entry("entry-1"), sample_entry("entry-2")],
+            screens: vec![Screen::new("main")],
+            last_filters: Arc::new(Mutex::new(None)),
+        };
+        let bus = TestBus::new();
+        let handler = RaymonMcp::new(store, bus);
+
+        let params: GetEntriesParams = serde_json::from_value(json!({
+            "uuids": ",entry-1,,entry-2,"
+        }))
+        .expect("get entries params should deserialize");
+
+        let result = handler.get_entries(Parameters(params)).await.expect("should not error");
+        let uuids = result.0.entries.into_iter().map(|entry| entry.uuid).collect::<Vec<_>>();
+
+        assert_eq!(uuids, vec!["entry-1", "entry-2"]);
+    }
+
+    #[tokio::test]
     async fn get_entries_returns_full_payloads_by_default() {
         let store = TestStore {
             entries: vec![sample_sensitive_entry("entry-sensitive")],
@@ -1110,6 +1163,43 @@ mod tests {
         assert_eq!(full["payloads"][0]["content"]["password"], "secret");
         assert_eq!(redacted["payloads"][0]["content"]["password"], "[[raymon:sensitive redacted]]");
         assert_eq!(redacted["payloads"][0]["content"]["message"], "visible");
+    }
+
+    fn notification_payload(notification: ServerNotification) -> Value {
+        match notification {
+            ServerNotification::CustomNotification(notification) => {
+                serde_json::to_value(notification.params.expect("params")).expect("params json")
+            }
+            other => panic!("expected custom notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lagged_notification_signals_drop() {
+        let payload = notification_payload(lagged_notification(7));
+        assert_eq!(payload["type"], "lagged");
+        assert_eq!(payload["dropped"], 7);
+    }
+
+    #[tokio::test]
+    async fn broadcast_event_stream_surfaces_lag_instead_of_swallowing() {
+        let (tx, rx) = broadcast::channel::<Event>(2);
+        let mut rx = rx;
+
+        for idx in 0..4 {
+            tx.send(Event::EntryInserted(sample_entry(&format!("entry-{idx}")))).expect("send");
+        }
+
+        match EventStream::recv(&mut rx).await {
+            Some(StreamMessage::Lagged(skipped)) => assert!(skipped >= 1),
+            Some(StreamMessage::Event(_)) => panic!("expected a lag signal, got an event"),
+            None => panic!("expected a lag signal, got stream end"),
+        }
+
+        match EventStream::recv(&mut rx).await {
+            Some(StreamMessage::Event(_)) => {}
+            other => panic!("expected a buffered event after lag, got {:?}", other.is_none()),
+        }
     }
 
     #[tokio::test]

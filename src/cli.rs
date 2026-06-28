@@ -1,3 +1,8 @@
+//! CLI runtime that wires HTTP ingest, durable storage, core state, MCP, and the terminal UI.
+//!
+//! Owns process lifecycle and bridges the in-memory entry cache with concurrent ingest and live
+//! MCP/TUI subscribers.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
@@ -64,6 +69,7 @@ pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug)]
 enum UiEvent {
     Log(LogEntry),
+    UpdateLog(LogEntry),
     ClearScreen(String),
     ClearAll,
     Resync { dropped: usize, logs: Vec<LogEntry> },
@@ -273,9 +279,14 @@ impl FileConfig {
             allow_insecure_remote: self.allow_insecure_remote,
             allow_mcp_shutdown: self.allow_mcp_shutdown,
             mcp_redact_payloads: self.mcp_redact_payloads,
-            auth_token: self.auth_token,
+            auth_token: self.auth_token.and_then(normalize_auth_token),
         }
     }
+}
+
+fn normalize_auth_token(token: String) -> Option<String> {
+    let trimmed = token.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -312,10 +323,15 @@ impl AppState {
     }
 }
 
+// Shards that serialize per-UUID ingest merges; sized above HTTP concurrency so distinct UUIDs
+// rarely contend on the same lock.
+const INGEST_MERGE_SHARDS: usize = 128;
+
 #[derive(Clone)]
 struct CoreState {
     inner: Arc<RwLock<StateInner>>,
     max_entries: usize,
+    merge_locks: Arc<[Mutex<()>; INGEST_MERGE_SHARDS]>,
 }
 
 #[derive(Default)]
@@ -334,7 +350,17 @@ enum StateError {
 
 impl CoreState {
     fn new(max_entries: usize) -> Self {
-        Self { inner: Arc::new(RwLock::new(StateInner::default())), max_entries }
+        Self {
+            inner: Arc::new(RwLock::new(StateInner::default())),
+            max_entries,
+            merge_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+        }
+    }
+
+    // Coordination lock only; poison recovery is safe because guarded data lives in the RwLock.
+    fn merge_guard(&self, uuid: &str) -> std::sync::MutexGuard<'_, ()> {
+        let shard = (log_id(uuid) as usize) % INGEST_MERGE_SHARDS;
+        self.merge_locks[shard].lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn insert(&self, entry: CoreEntry) -> Result<(), StateError> {
@@ -455,8 +481,23 @@ impl CoreStateStoreTrait for CoreState {
         filters: &Filters,
     ) -> Result<(Vec<CoreEntry>, usize), Self::Error> {
         let inner = self.inner.read().map_err(|_| StateError::Poisoned)?;
+        // Bounded scan windows sample the newest entries (tail of order), then restore
+        // chronological order within the window for stable pagination.
+        let window: Vec<&CoreEntry> = match filters.scan_limit {
+            Some(scan_limit) => inner
+                .order
+                .iter()
+                .rev()
+                .filter_map(|uuid| inner.entries_by_uuid.get(uuid))
+                .take(scan_limit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            None => inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)).collect(),
+        };
         let (matches, count) = filters
-            .apply_with_count(inner.order.iter().filter_map(|uuid| inner.entries_by_uuid.get(uuid)))
+            .apply_with_count(window)
             .map_err(|error| StateError::Filter(error.to_string()))?;
         Ok((matches.into_iter().cloned().collect(), count))
     }
@@ -540,6 +581,10 @@ impl crate::raymon_ingest::StateStore for IngestState {
 
     fn get_entry(&self, uuid: &str) -> Result<Option<CoreEntry>, String> {
         self.core.get(uuid).map_err(|error| error.to_string())
+    }
+
+    fn ingest_guard(&self, uuid: &str) -> crate::raymon_ingest::IngestGuard<'_> {
+        crate::raymon_ingest::IngestGuard::Locked(self.core.merge_guard(uuid))
     }
 }
 
@@ -1160,9 +1205,7 @@ fn env_overrides(env: &BTreeMap<String, String>) -> Result<PartialConfig, Config
         partial.mcp_redact_payloads = Some(parse_bool("RAYMON_MCP_REDACT_PAYLOADS", value)?);
     }
     if let Some(value) = env.get("RAYMON_AUTH_TOKEN").or_else(|| env.get("RAYMON_TOKEN")) {
-        if !value.trim().is_empty() {
-            partial.auth_token = Some(value.clone());
-        }
+        partial.auth_token = normalize_auth_token(value.clone());
     }
     if let Some(no_tui) = env.get("RAYMON_NO_TUI") {
         let disabled = parse_bool("RAYMON_NO_TUI", no_tui)?;
@@ -1412,6 +1455,7 @@ fn run_tui_loop(
         while let Ok(event) = log_rx.try_recv() {
             match event {
                 UiEvent::Log(entry) => tui.push_log(entry),
+                UiEvent::UpdateLog(entry) => tui.update_log(entry),
                 UiEvent::ClearScreen(screen) => tui.clear_screen_for(Some(&screen)),
                 UiEvent::ClearAll => tui.clear_screen_for(None),
                 UiEvent::Resync { dropped, logs } => {
@@ -1549,11 +1593,21 @@ async fn forward_events_to_ui(
             }
             res = event_rx.recv() => match res {
                 Ok(event) => {
-                    let ui_event = match event {
-                        CoreEvent::EntryInserted(entry) | CoreEvent::EntryUpdated(entry) => {
+                    // After a clear, pre-clear UUIDs keep their original received_at; suppress
+                    // updates that would repopulate a cleared list unless already visible.
+                    let mut visible = |entry: &CoreEntry| -> bool {
+                        if entry.received_at >= started_at || seen_uuids.contains(&entry.uuid) {
                             seen_uuids.insert(entry.uuid.clone());
-                            Some(UiEvent::Log(log_entry_from_core(&entry)))
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    let ui_event = match event {
+                        CoreEvent::EntryInserted(entry) => visible(&entry)
+                            .then(|| UiEvent::Log(log_entry_from_core(&entry))),
+                        CoreEvent::EntryUpdated(entry) => visible(&entry)
+                            .then(|| UiEvent::UpdateLog(log_entry_from_core(&entry))),
                         CoreEvent::ScreenCleared(screen) => {
                             Some(UiEvent::ClearScreen(screen.as_str().to_string()))
                         }
@@ -2358,6 +2412,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_file_auth_token_is_treated_as_unset() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ray.json");
+        fs::write(&path, r#"{ "host": "0.0.0.0", "auth_token": "" }"#).expect("write");
+        let partial = load_config_file(&path).expect("load");
+        assert!(partial.auth_token.is_none(), "empty auth_token must not count as configured auth");
+
+        fs::write(&path, r#"{ "auth_token": "   " }"#).expect("write");
+        let partial = load_config_file(&path).expect("load");
+        assert!(
+            partial.auth_token.is_none(),
+            "whitespace-only auth_token must not count as configured auth"
+        );
+
+        fs::write(&path, r#"{ "auth_token": " secret " }"#).expect("write");
+        let partial = load_config_file(&path).expect("load");
+        assert_eq!(partial.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn env_auth_token_is_trimmed() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("RAYMON_AUTH_TOKEN".to_string(), " secret ".to_string());
+
+        let partial = env_overrides(&env_map).expect("env overrides");
+
+        assert_eq!(partial.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
     fn build_search_text_includes_type_and_color() {
         let screen = Screen::new("proj:host:default");
         let entry = CoreEntry {
@@ -2533,6 +2617,52 @@ mod tests {
             .and_then(|value| value.as_str())
             .expect("message");
         assert_eq!(message, "updated");
+    }
+
+    #[test]
+    fn list_entries_with_count_scan_window_covers_newest_entries() {
+        let core = CoreState::new(0);
+        let screen = Screen::new("proj:host:default");
+
+        for idx in 0..10u64 {
+            let uuid = format!("entry-{idx}");
+            let entry = CoreEntry {
+                uuid: uuid.clone(),
+                received_at: idx,
+                project: "proj".to_string(),
+                host: "host".to_string(),
+                screen: screen.clone(),
+                session_id: None,
+                payloads: vec![crate::raymon_core::Payload {
+                    r#type: "log".to_string(),
+                    content: serde_json::json!({ "message": uuid }),
+                    origin: crate::raymon_core::Origin {
+                        project: "proj".to_string(),
+                        host: "host".to_string(),
+                        screen: Some(screen.clone()),
+                        session_id: None,
+                        function_name: None,
+                        file: None,
+                        line_number: None,
+                    },
+                }],
+            };
+            core.insert(entry).expect("insert");
+        }
+
+        let filters = Filters { scan_limit: Some(3), ..Default::default() };
+        let (entries, count) =
+            CoreStateStoreTrait::list_entries_with_count(&core, &filters).expect("list");
+        let uuids: Vec<String> = entries.into_iter().map(|entry| entry.uuid).collect();
+        assert_eq!(uuids, vec!["entry-7", "entry-8", "entry-9"]);
+        assert_eq!(count, 3);
+
+        let (all, all_count) =
+            CoreStateStoreTrait::list_entries_with_count(&core, &Filters::default()).expect("list");
+        assert_eq!(all.len(), 10);
+        assert_eq!(all_count, 10);
+        assert_eq!(all.first().expect("first").uuid, "entry-0");
+        assert_eq!(all.last().expect("last").uuid, "entry-9");
     }
 
     #[test]
@@ -2899,5 +3029,63 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_events_respects_clear_epoch_on_live_updates() {
+        use std::time::Duration;
+
+        let screen = Screen::new("proj:host:default");
+        let make_entry = |uuid: &str, received_at: u64| CoreEntry {
+            uuid: uuid.to_string(),
+            received_at,
+            project: "proj".to_string(),
+            host: "host".to_string(),
+            screen: screen.clone(),
+            session_id: None,
+            payloads: vec![crate::raymon_core::Payload {
+                r#type: "log".to_string(),
+                content: serde_json::json!({ "message": uuid }),
+                origin: crate::raymon_core::Origin {
+                    project: "proj".to_string(),
+                    host: "host".to_string(),
+                    screen: Some(screen.clone()),
+                    session_id: None,
+                    function_name: None,
+                    file: None,
+                    line_number: None,
+                },
+            }],
+        };
+
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let (clear_tx, clear_rx) = watch::channel(0u64);
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let core = CoreState::new(0);
+
+        let handle = tokio::spawn(forward_events_to_ui(event_rx, clear_rx, ui_tx, core));
+
+        event_tx.send(CoreEvent::EntryInserted(make_entry("A", 1))).expect("send");
+        match ui_rx.recv_timeout(Duration::from_secs(1)).expect("event A") {
+            UiEvent::Log(log) => assert_eq!(log.uuid, "A"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        clear_tx.send(5).expect("clear");
+        event_tx.send(CoreEvent::EntryUpdated(make_entry("A", 1))).expect("send");
+        event_tx.send(CoreEvent::EntryInserted(make_entry("B", 6))).expect("send");
+
+        match ui_rx.recv_timeout(Duration::from_secs(1)).expect("event B") {
+            UiEvent::Log(log) => {
+                assert_eq!(log.uuid, "B", "pre-clear update must not reappear after Ctrl+l")
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert!(ui_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(event_tx);
+        drop(clear_tx);
+        let _ = handle.await;
     }
 }
