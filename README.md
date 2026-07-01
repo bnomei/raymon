@@ -8,71 +8,304 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-Stateful HTTP ingest + MCP server + terminal UI for Ray-style logs.
+Raymon is a local-first Ray-style log receiver with an HTTP ingest endpoint, a Streamable HTTP MCP server, durable JSONL storage, and a Ratatui terminal UI.
 
-Raymon is:
-- CLI-first: one binary, local-first defaults.
-- MCP-first: a small set of tools with explicit schemas for agents/LLMs.
-- Keyboard-first: a [Ratatui](https://ratatui.rs) TUI designed for fast filtering, yanking, navigation and export.
+Use Raymon when you want Ray-compatible dumps from your app to be visible in a terminal and searchable by AI agents through MCP.
 
-<a title="click to open" target="_blank" style="cursor: zoom-in;" href="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png"><img src="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png" alt="screenshot" style="width: 100%;" /></a>
+<a title="click to open" target="_blank" style="cursor: zoom-in;" href="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png"><img src="https://raw.githubusercontent.com/bnomei/raymon/main/screenshot.png" alt="Raymon terminal UI screenshot" style="width: 100%;" /></a>
+
+## What Raymon provides
+
+| Surface | What it does |
+| --- | --- |
+| HTTP ingest | Accepts Ray-style JSON envelopes on `POST /`. |
+| MCP server | Exposes `raymon.search` and `raymon.get_entries` on `POST /mcp`. |
+| Terminal UI | Browses live logs, filters by screen/type/color, opens payloads, yanks details, and manages JSONL archives. |
+| Storage | Persists entries to `data/entries.jsonl` under the active storage root. |
+| Rust crate API | Exposes `raymon::run()` plus public `raymon_core`, `raymon_ingest`, `raymon_storage`, `raymon_mcp`, and `raymon_tui` modules for embedding and tests. |
+
+Raymon listens on the Ray default port, `23517`, so many Ray client libraries can target it with little or no configuration.
+
+## Quickstart
+
+### Prerequisites
+
+- A Raymon binary from Cargo, Homebrew, GitHub Releases, or a local source build.
+- A terminal. The default run mode opens the TUI.
+
+### Run with generated events
+
+Start Raymon in demo mode:
+
+```bash
+raymon --demo
+```
+
+Expected result: the TUI opens and demo events begin appearing. Press `?` for help or `q` to stop Raymon.
+
+### Run without the TUI and send one event
+
+Start Raymon in one terminal:
+
+```bash
+RAYMON_NO_TUI=1 raymon
+```
+
+Send a Ray-style event from another terminal:
+
+```bash
+curl -sS http://127.0.0.1:23517/ \
+  -H 'content-type: application/json' \
+  -d '{
+    "uuid": "readme-demo-1",
+    "payloads": [
+      {
+        "type": "log",
+        "content": {
+          "message": "hello from Raymon",
+          "color": "green"
+        },
+        "origin": {
+          "hostname": "local",
+          "fileName": "README.md",
+          "lineNumber": 1
+        }
+      }
+    ],
+    "meta": {
+      "project": "raymon-readme",
+      "host": "local",
+      "screen": "readme"
+    }
+  }'
+```
+
+Expected output contains:
+
+```json
+{"ok":true,"error":null}
+```
+
+Stop the server with `Ctrl+C`.
 
 ## Installation
 
-### Cargo (crates.io)
+### Cargo
+
+Raymon requires Rust `1.89` or newer.
+
 ```bash
 cargo install raymon
 ```
 
 ### Homebrew
+
 ```bash
 brew install bnomei/raymon/raymon
 ```
 
 ### GitHub Releases
-Download a prebuilt archive from the GitHub Releases page, extract it, and place `raymon` on your `PATH`.
+
+Download a prebuilt archive from [GitHub Releases](https://github.com/bnomei/raymon/releases), extract it, and place `raymon` on your `PATH`.
 
 ### From source
+
 ```bash
 git clone https://github.com/bnomei/raymon.git
 cd raymon
 cargo build --release
 ```
 
-## Quickstart
+The binary is written to `target/release/raymon`.
 
-### Sending Logs
+## Sending logs
 
-You can send from any compatible [Ray App](https://myray.app) library such as PHP, Javascript, Bash, Ruby, Python, Go and Dart.
-If you want a Rust-native way to send Ray-compatible payloads, use my companion library [`ray-dbg`](https://github.com/bnomei/ray-dbg).
+Raymon stores Ray-style log entries. Generate them with a Ray-compatible library in your application, then point that library at Raymon's host and port.
 
-### Run Raymon locally with TUI
+Known Ray integrations include PHP, JavaScript, Bash, Ruby, Python, Go, Dart, and Rust. For Rust-native payloads, see [`ray-dbg`](https://github.com/bnomei/ray-dbg).
 
-Run Raymon on the Ray default port:
+The default local endpoint is:
 
-```bash
-raymon
-# or
-RAYMON_PORT=23517 raymon
+```txt
+http://127.0.0.1:23517/
 ```
 
-### Demo mode (self-generates events):
+If your sender uses the Ray desktop defaults, Raymon usually works by starting `raymon` before you emit logs.
 
-```bash
-raymon --demo
-```
+Inbound envelopes must include a non-empty `uuid`, at least one payload, a non-empty `payloads[*].type`, and a non-empty `payloads[*].origin.hostname`. When the same UUID is ingested more than once, Raymon merges the payloads into one entry and stores the merged entry before it publishes live state or events.
 
-### TUI<-->MCPs (Streamable HTTP)
+## Run modes
 
-1) Start **your local HTTP** with TUI listening to default port `23517`
+### Local TUI
+
 ```bash
 raymon
 ```
 
-2) Add the local HTTP to the **agents harness** via MCP settings:
+This starts the HTTP ingest endpoint, the MCP endpoint, and the TUI on `127.0.0.1:23517`.
+
+### Headless local server
+
+```bash
+RAYMON_NO_TUI=1 raymon
+```
+
+Use this for background logging, MCP-only workflows, or tests.
+
+### Remote server with auth
+
+```bash
+export RAYMON_AUTH_TOKEN="change-me"
+RAYMON_ALLOW_REMOTE=1 \
+RAYMON_HOST=0.0.0.0 \
+RAYMON_NO_TUI=1 \
+raymon
+```
+
+Raymon refuses non-loopback binds unless `RAYMON_ALLOW_REMOTE=1` is set. If the bind address is non-loopback, Raymon also requires `RAYMON_AUTH_TOKEN` unless you explicitly set `RAYMON_ALLOW_INSECURE_REMOTE=1`.
+
+## CLI reference
+
+```txt
+raymon [OPTIONS]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--host <HOST>` | Override the HTTP bind host. |
+| `--port <PORT>` | Override the HTTP bind port. |
+| `--config <PATH>` | Load a specific JSON config file instead of searching for `ray.json`. |
+| `--ide <COMMAND>` | Command used by the TUI to open origin files. |
+| `--editor <COMMAND>` | Command used by the TUI to open selected detail payloads in a temp file. |
+| `--jq <COMMAND>` | `jq` command used for detail-pane searches. |
+| `--tui` | Enable the TUI. |
+| `--no-tui` | Disable the TUI. |
+| `--demo` | Generate local demo events. |
+| `-v`, `--verbose` | Enable info logging. Use `-vv` for debug logging. |
+| `-h`, `--help` | Print CLI help. |
+| `-V`, `--version` | Print the Raymon version. |
+
+Configuration precedence is:
+
+1. Defaults.
+2. `ray.json`.
+3. Environment variables.
+4. CLI flags.
+
+## Configuration
+
+Raymon searches for `ray.json` from the current directory upward. If it finds one, the directory containing that file becomes the storage root. Without `ray.json`, the current working directory is the storage root.
+
+Example `ray.json`:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 23517,
+  "tui": true,
+  "max_entries": 10000,
+  "storage_max_entries": 100000,
+  "mcp_redact_payloads": false
+}
+```
+
+Environment variables use the same concepts with `RAYMON_` names:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RAYMON_ENABLED` | `true` | Enable or disable Raymon. |
+| `RAYMON_HOST` | `127.0.0.1` | HTTP bind address. |
+| `RAYMON_PORT` | `23517` | HTTP bind port. |
+| `RAYMON_TUI` | `true` | Enable the TUI. |
+| `RAYMON_NO_TUI` | `false` | Disable the TUI. Takes precedence over `RAYMON_TUI`. |
+| `RAYMON_IDE` | `code` | IDE command used for origin-file jumps. For VS Code line jumps, use `code --goto`. |
+| `RAYMON_EDITOR` | `VISUAL`/`EDITOR`/`vim` | Editor command used for selected detail payloads. |
+| `RAYMON_JQ` | `jq` | `jq` command used for detail search. |
+| `RAYMON_MAX_BODY_BYTES` | `1048576` | Maximum HTTP request body size and merged stored-entry size. |
+| `RAYMON_MAX_QUERY_LEN` | `265` | Maximum search, command, picker, and MCP query length in bytes. |
+| `RAYMON_MAX_ENTRIES` | `10000` | Maximum entries kept in memory for MCP and live resync. `0` disables in-memory eviction. |
+| `RAYMON_STORAGE_MAX_ENTRIES` | `100000` | Maximum distinct entries kept in `data/entries.jsonl`. `0` disables storage retention. |
+| `RAYMON_JQ_TIMEOUT_MS` | `10000` | Detail-search `jq` timeout in milliseconds. |
+| `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
+| `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow non-loopback binding without auth. Avoid this unless you accept the exposure risk. |
+| `RAYMON_INSECURE_REMOTE` | unset | Alias for `RAYMON_ALLOW_INSECURE_REMOTE`. |
+| `RAYMON_ALLOW_MCP_SHUTDOWN` | `false` | Allow MCP `ray/quit`, `ray/exit`, `raymon/quit`, and `raymon/exit` custom methods to stop Raymon. |
+| `RAYMON_MCP_REDACT_PAYLOADS` | `false` | Redact sensitive-looking payload fields in MCP results and event notifications. |
+| `RAYMON_AUTH_TOKEN` | unset | Require `Authorization: Bearer <token>` or `x-raymon-token: <token>` for all HTTP requests. |
+| `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
+| `RAYMON_TUI_PALETTE` | unset | Override the TUI palette with 18 comma-separated colors. |
+| `RAYMON_PALETTE` | unset | Alias for `RAYMON_TUI_PALETTE`. |
+| `RAYMON_LOG` | unset | Tracing filter. Falls back to `RUST_LOG` when unset. |
+
+`RAYMON_TUI_PALETTE` expects:
+
+```txt
+fg,bg,black,red,green,yellow,blue,magenta,cyan,white,bright_black,bright_red,bright_green,bright_yellow,bright_blue,bright_magenta,bright_cyan,bright_white
+```
+
+Each color can be `#RRGGBB`, `rgb:RR/GG/BB`, or `rgb:RRRR/GGGG/BBBB`.
+
+## Storage
+
+Raymon stores entries as newline-delimited JSON in:
+
+```txt
+data/entries.jsonl
+```
+
+The `data/` directory is created under the active storage root. The TUI also writes session archives under:
+
+```txt
+data/archives/
+```
+
+On startup, Raymon restores stored entries into the core state so MCP search can see persisted logs. The TUI starts with a fresh live view and lets you browse archive files from the archives pane.
+
+Retention keeps the newest distinct UUIDs. During restore, Raymon skips corrupt JSONL lines and legacy blob entries instead of aborting startup.
+
+## HTTP API
+
+| Method and path | Purpose |
+| --- | --- |
+| `POST /` | Ray ingest endpoint for Ray payload envelopes. |
+| `POST /mcp` | MCP Streamable HTTP endpoint. Prefer this path for MCP clients. |
+
+`POST /` also accepts MCP JSON-RPC requests as a compatibility fallback when ingest parsing rejects the body and the JSON looks like MCP JSON-RPC. Prefer `/mcp` for new MCP clients.
+
+When `RAYMON_AUTH_TOKEN` is set, every request must include one of these headers:
+
+```txt
+Authorization: Bearer <token>
+x-raymon-token: <token>
+```
+
+Ingest responses use HTTP status codes:
+
+| Status | Meaning |
+| --- | --- |
+| `200` | The envelope was stored and published. |
+| `400` | The request body was invalid JSON. |
+| `413` | The merged entry exceeded `RAYMON_MAX_BODY_BYTES`. |
+| `422` | The envelope was missing required fields or had invalid data. |
+| `500` | Storage, state, or event-bus handling failed. |
+
+## MCP setup
+
+Add a local Raymon MCP server to Codex:
+
 ```bash
 codex mcp add raymon --url http://127.0.0.1:23517/mcp
 ```
+
+Remote setup with bearer-token auth:
+
+```bash
+codex mcp add raymon \
+  --url http://<host>:23517/mcp \
+  --bearer-token-env-var RAYMON_AUTH_TOKEN
+```
+
+Equivalent MCP JSON:
 
 ```json
 {
@@ -84,20 +317,7 @@ codex mcp add raymon --url http://127.0.0.1:23517/mcp
 }
 ```
 
-### Remote (Streamable HTTP)
-
-1) Start Raymon (recommended: require + send auth)
-```bash
-export RAYMON_AUTH_TOKEN="change-me"
-RAYMON_ALLOW_REMOTE=1 RAYMON_HOST=0.0.0.0 RAYMON_NO_TUI=1 RAYMON_AUTH_TOKEN="$RAYMON_AUTH_TOKEN" raymon
-```
-
-Raymon will refuse non-loopback binds without `RAYMON_AUTH_TOKEN` unless you set `RAYMON_ALLOW_INSECURE_REMOTE=1`.
-
-2) Add it to your MCP client:
-```bash
-codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON_AUTH_TOKEN
-```
+Remote MCP JSON with auth:
 
 ```json
 {
@@ -112,179 +332,235 @@ codex mcp add raymon --url http://<host>:23517/mcp --bearer-token-env-var RAYMON
 }
 ```
 
-## HTTP Endpoints
+## MCP tools
 
-- `POST /`: Ray ingest endpoint for Ray payload envelopes.
-  - Also keeps a compatibility fallback enabled by default for MCP clients that post JSON-RPC
-    requests to the root path: when ingest parsing rejects the body and the JSON body looks like
-    MCP JSON-RPC (`{"jsonrpc":"2.0","method":...}` or a batch containing one), Raymon forwards the
-    request to the MCP service instead of returning an ingest error. Valid Ray ingest envelopes are
-    still ingested normally.
-- `POST /mcp`: Normal MCP Streamable HTTP endpoint. Prefer this route for MCP clients.
+Raymon exposes two read-only tools.
 
-## MCP Tools
+### `raymon.search`
 
-Raymon exposes an intentionally small tool surface so it stays usable for agents.
+Search stored entries and return compact summaries.
 
-Tools and their input/output shapes:
+Input:
 
-- `raymon.search` - search stored entries (supports `limit` + `offset`)
+```json
+{
+  "query": "string (optional; plain text or /regex/)",
+  "types": ["string"],
+  "colors": ["string"],
+  "screen": "string (optional)",
+  "project": "string (optional)",
+  "host": "string (optional)",
+  "limit": "number (optional)",
+  "offset": "number (optional)"
+}
+```
 
-  Parameters:
-  ```json
-  {
-    "query": "string (optional; plain text or /regex/)",
-    "types": ["string"],
-    "colors": ["string"],
-    "screen": "string (optional)",
-    "project": "string (optional)",
-    "host": "string (optional)",
-    "limit": "number (optional)",
-    "offset": "number (optional)"
-  }
-  ```
-  `types` and `colors` also accept comma-separated strings, e.g. `{ "types": "error,exception" }`.
+`types` and `colors` also accept comma-separated strings:
 
-  Result:
-  ```json
-  {
-    "entries": [
-      {
-        "uuid": "string",
-        "received_at": "number",
-        "project": "string",
-        "host": "string",
-        "screen": "string",
-        "payload_count": "number",
-        "payload_types": ["string"]
-      }
-    ],
-    "count": "number",
-    "limit": "number",
-    "offset": "number",
-    "scan_limit": "number"
-  }
-  ```
-  `count` is the number of entries matching the filters within the bounded scan window
-  (ignores `limit`/`offset`).
+```json
+{ "types": "error,exception", "colors": "red" }
+```
 
-- `raymon.get_entries` - fetch entries by UUID(s)
+Result:
 
-  Parameters:
-  ```json
-  { "uuids": ["string"], "redact": "boolean (optional; default false)" }
-  ```
-  Fallback (legacy/single): `{ "uuid": "string" }`.
-  String values also accept comma-separated UUIDs: `{ "uuids": "id-1,id-2" }`.
-  In comma-separated string form, whitespace in each UUID token is ignored.
-  Set `redact` (or `redacted` / `redact_payloads`) to `true` to return a redacted MCP view
-  where sensitive-looking payload fields such as passwords, tokens, API keys, cookies, and secrets
-  are replaced. Full payloads remain the default.
-  Requests are limited to 100 UUIDs, 265 bytes per UUID, and a 1 MiB serialized MCP tool result.
+```json
+{
+  "entries": [
+    {
+      "uuid": "string",
+      "received_at": 0,
+      "project": "string",
+      "host": "string",
+      "screen": "string",
+      "payload_count": 1,
+      "payload_types": ["log"]
+    }
+  ],
+  "count": 1,
+  "limit": 100,
+  "offset": 0,
+  "scan_limit": 5000
+}
+```
 
-  Result:
-  ```json
-  {
-    "entries": [
-      {
-        "uuid": "string",
-        "received_at": "number",
-        "project": "string",
-        "host": "string",
-        "screen": "string",
-        "session_id": "string (or null)",
-        "payloads": [
-          {
-            "type": "string",
-            "content": "any",
-            "origin": {
-              "project": "string",
-              "host": "string",
-              "screen": "string (or null)",
-              "session_id": "string (or null)",
-              "function_name": "string (or null)",
-              "file": "string (or null)",
-              "line_number": "number (or null)"
-            }
+Defaults and limits:
+
+| Field | Default | Limit |
+| --- | --- | --- |
+| `limit` | `100` | `500` |
+| `offset` | `0` | `5000` |
+| `scan_limit` | `5000` | Fixed newest-entry scan window |
+| `query` | unset | `RAYMON_MAX_QUERY_LEN` bytes |
+
+### `raymon.get_entries`
+
+Fetch full entries by UUID.
+
+Input:
+
+```json
+{
+  "uuids": ["<uuid>"],
+  "redact": false
+}
+```
+
+Supported input aliases:
+
+```json
+{ "uuid": "<uuid>" }
+```
+
+```json
+{ "uuids": "<uuid-1>,<uuid-2>" }
+```
+
+`redacted` and `redact_payloads` are aliases for `redact`. When redaction is enabled, Raymon replaces sensitive-looking payload fields such as passwords, tokens, API keys, cookies, and secrets.
+
+Result:
+
+```json
+{
+  "entries": [
+    {
+      "uuid": "string",
+      "received_at": 0,
+      "project": "string",
+      "host": "string",
+      "screen": "string",
+      "session_id": null,
+      "payloads": [
+        {
+          "type": "log",
+          "content": {},
+          "origin": {
+            "project": "string",
+            "host": "string",
+            "screen": "string",
+            "session_id": null,
+            "function_name": null,
+            "file": null,
+            "line_number": null
           }
-        ]
-      }
-    ]
-  }
-  ```
+        }
+      ]
+    }
+  ]
+}
+```
 
-## Skill
+Limits:
 
-This repo includes a [skill](https://agentskills.io) at `skills/raymon/SKILL.md` (an AI-facing runbook, not runtime code) that teaches an agent how to:
+| Limit | Value |
+| --- | --- |
+| UUIDs per request | `100` |
+| Bytes per UUID | `265` |
+| Serialized tool result | `1048576` bytes |
 
-- generate Ray-style events using the official/community Ray libraries (PHP, JavaScript, Bash, Ruby, Rust, Python, Go, Dart),
-- connect to Raymon locally or remotely (with auth) and add it as an MCP server, and
-- use `raymon.search` → `raymon.get_entries` to triage logs and extract high-signal context (uuid, payload types, origin file/line).
+Connected MCP peers receive `ray/event` notifications for inserted, updated, cleared, and lagged events. If a client receives a lag notification, it should refresh with `raymon.search`.
 
 ## TUI
 
-The TUI is intentionally "editor-like" (vim-ish):
-- `?` opens keybindings/help.
-- `q` quits (and shuts down the HTTP/MCP server).
-- `Space` opens the pickers/filters modal.
-- `/` searches (fuzzy, message + file; path-like queries are literal), `r` opens regex search (message + file).
-- `:` searches inside detail ([jq](https://jqlang.org)).
-- `J/K` or `PageUp/PageDown` scrolls the detail pane.
-- `s` snaps the color + type filters to the selected log entry.
-- `p` pauses/resumes live updates.
-- `x` archives the current view (writes a new archive file).
-- `n` (in the Archives pane) renames the selected archive file (confirm with Enter; Esc cancels; live cannot be renamed).
-- `d` (in the Archives pane) deletes the selected archive (confirm required; live cannot be deleted).
-- `y` yanks the selected list entry, `Y` yanks the detail pane.
-- `z` toggles JSON expanded/collapsed (default: expanded), `Z` toggles raw JSON.
-- `u` resets search + filters (screens/types/colors).
-- `Ctrl+y` pastes the yank register into inputs.
-- `Ctrl+l` clears the live log list (does not delete stored entries).
-- `1` toggles color dot, `2` timestamp, `3` type label, `4` file, `5` message, `6` uuid (short).
-- `o` opens the origin in your IDE (see `RAYMON_IDE`), `e` opens the detail in `$EDITOR` via a temp file.
-- In the Archives pane, `Enter` loads the selected archive; the green `‣` row returns to live (`◼` = active archive, `◻` = inactive).
+The TUI is keyboard-first and has built-in help. Press `?` for the full keymap.
 
-### Theming
+| Key | Action |
+| --- | --- |
+| `?` | Open keybindings. |
+| `q` | Quit Raymon and stop the HTTP/MCP server. |
+| `Space` | Open the picker menu. |
+| `/` or `f` | Search messages and file paths with fuzzy search. |
+| `r` | Start a regex search. |
+| `:` | Search inside the selected detail payload. Uses `jq` for JSON queries when available. |
+| `j`/`k`, arrows | Move in the focused pane. |
+| `h`/`l`, left/right arrows | Move focus left or right. |
+| `J`/`K`, `PageUp`/`PageDown` | Scroll the detail pane. |
+| `Tab`, `Shift+Tab` | Move focus between logs, detail, and archives. |
+| `g` | Go to a log position. |
+| `G` | Jump to the last log. |
+| `s` | Snap color and type filters to the selected log entry. |
+| `u` | Reset search and filters. |
+| `p` | Pause or resume live updates. |
+| `a` | Toggle the archives pane. |
+| `x` | Archive the current view to a JSONL file. |
+| `Enter` | Load the selected archive when the archives pane has focus. |
+| `n` | Rename the selected archive. Live archives cannot be renamed. |
+| `d` | Delete the selected archive after confirmation. Live archives cannot be deleted. |
+| `y` | Yank the selected list entry. |
+| `Y` | Yank the selected detail payload. |
+| `z` | Toggle expanded JSON rendering. |
+| `Z` | Toggle raw JSON rendering. |
+| `m` | Toggle style and metadata payloads in the detail pane. |
+| `1` through `6` | Toggle list columns: color dot, timestamp, type label, file, message, UUID. |
+| `o` | Open the origin file in the configured IDE. |
+| `e` | Open the selected detail payload in the configured editor. |
+| `Ctrl+l` | Clear the live log list without deleting stored entries. |
+| `Ctrl+c` | Quit from anywhere. |
 
-Raymon sticks to the terminal's ANSI palette (16 colors + text attributes like bold/dim/reverse), so it inherits your terminal theme (light/dark, base16, etc)without implementing full app theming. You can also enforce a set of colors via an `RAYMON_TUI_PALETTE` environment variable.
+Mouse support is enabled: click to focus or select, and use the wheel to move through the pane under the pointer.
 
-## Configuration
+Raymon uses the terminal ANSI palette by default, so it inherits light, dark, and base16-style terminal themes. Use `RAYMON_TUI_PALETTE` when you need a fixed palette.
 
-Raymon is configured primarily via environment variables:
+## Agent skill
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `RAYMON_ENABLED` | `true` | Enable/disable the server. |
-| `RAYMON_HOST` | `127.0.0.1` | Bind address for the HTTP server. |
-| `RAYMON_PORT` | `23517` | Bind port for the HTTP server. |
-| `RAYMON_TUI` | `true` | Enable the TUI. |
-| `RAYMON_NO_TUI` | `false` | Disable the TUI (takes precedence over `RAYMON_TUI`). |
-| `RAYMON_IDE` | `code` | IDE command used for "open origin" (for VS Code line jumps, use `code --goto`). Raymon only opens validated local origin files. |
-| `RAYMON_EDITOR` | `VISUAL`/`EDITOR`/`vim` | Editor command used for "open in editor". |
-| `RAYMON_JQ` | `jq` | `jq` command used for detail search. |
-| `RAYMON_TUI_PALETTE` | unset | Optional TUI palette override: 18 comma-separated colors `fg,bg,black,red,green,yellow,blue,magenta,cyan,white,bright_black,bright_red,bright_green,bright_yellow,bright_blue,bright_magenta,bright_cyan,bright_white` as `#RRGGBB` (also accepts `rgb:RRRR/GGGG/BBBB`). |
-| `RAYMON_PALETTE` | unset | Alias for `RAYMON_TUI_PALETTE`. |
-| `RAYMON_MAX_BODY_BYTES` | `1048576` | Max size (bytes) for HTTP POST bodies and merged stored entries. |
-| `RAYMON_MAX_QUERY_LEN` | `265` | Max length (bytes) for search/command/picker queries. |
-| `RAYMON_MAX_ENTRIES` | `10000` | Max number of entries kept in memory for the core state (MCP + resync). `0` disables eviction. |
-| `RAYMON_STORAGE_MAX_ENTRIES` | `100000` | Max number of entries kept in `data/entries.jsonl`. When exceeded, Raymon rewrites the JSONL file keeping the newest entries. `0` disables retention. |
-| `RAYMON_JQ_TIMEOUT_MS` | `10000` | `jq` timeout in milliseconds. |
-| `RAYMON_ALLOW_REMOTE` | `false` | Allow binding to non-loopback addresses. |
-| `RAYMON_ALLOW_INSECURE_REMOTE` | `false` | Allow binding to non-loopback addresses without auth (NOT recommended). |
-| `RAYMON_ALLOW_MCP_SHUTDOWN` | `false` | Allow custom MCP `ray/quit`, `ray/exit`, `raymon/quit`, and `raymon/exit` methods to stop Raymon. |
-| `RAYMON_MCP_REDACT_PAYLOADS` | `false` | Redact sensitive-looking payload fields in MCP `get_entries` results and MCP event notifications. Per-request redaction is also available with `raymon.get_entries` `redact: true`. |
-| `RAYMON_AUTH_TOKEN` | unset | If set, requires `Authorization: Bearer <token>` or `x-raymon-token: <token>` on all HTTP requests, including both `POST /` and `POST /mcp`. |
-| `RAYMON_TOKEN` | unset | Alias for `RAYMON_AUTH_TOKEN`. |
+This repository includes an AI-facing runbook at [`skills/raymon/SKILL.md`](skills/raymon/SKILL.md). It teaches agents how to:
 
-Raymon also supports a `ray.json` config file (searched from the current directory upwards). Keys mirror env vars (e.g. `host`, `port`, `tui`, `max_entries`, `storage_max_entries`). CLI flags override env and file config.
+- Generate Ray-style events with common Ray integrations.
+- Add Raymon as a local or remote MCP server.
+- Use `raymon.search` before `raymon.get_entries` to inspect logs efficiently.
 
-## Local Pre-commit
+The skill is documentation for agents. It is not runtime code.
+
+## Source layout
+
+| Path | Purpose |
+| --- | --- |
+| [`src/cli.rs`](src/cli.rs) | Runtime lifecycle, configuration, storage restore, demo mode, and TUI/server orchestration. |
+| [`src/cli/http.rs`](src/cli/http.rs) | Axum router, auth, body limits, concurrency limits, ingest, and MCP mounting. |
+| [`src/raymon_core.rs`](src/raymon_core.rs) | IO-free domain types, filters, events, and Ray envelope normalization. |
+| [`src/raymon_ingest.rs`](src/raymon_ingest.rs) | HTTP ingest parsing, validation, duplicate-UUID merging, storage, and event emission. |
+| [`src/raymon_mcp.rs`](src/raymon_mcp.rs) | MCP tools, notifications, query limits, result limits, and shutdown hooks. |
+| [`src/raymon_mcp/schema.rs`](src/raymon_mcp/schema.rs) | MCP request and response schemas. |
+| [`src/raymon_storage/`](src/raymon_storage) | JSONL persistence, indexing, listing, and retention. |
+| [`src/raymon_tui.rs`](src/raymon_tui.rs) | TUI state, rendering, search, filtering, key handling, editor integration, and archive workflows. |
+| [`tests/ray_php_local.rs`](tests/ray_php_local.rs) | Ignored local PHP/Ray integration test. |
+
+## Development
+
+Run the Rust test suite:
+
+```bash
+cargo test --all-targets
+```
+
+Run formatting and clippy checks:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Run pre-commit hooks when `prek` is installed:
 
 ```bash
 prek validate-config prek.toml
 prek run --all-files
 prek install
 ```
+
+Run the local-only PHP Ray integration test after installing the global PHP `ray()` helper:
+
+```bash
+cargo test --test ray_php_local -- --ignored ray_php_local_integration
+```
+
+Build and package release artifacts:
+
+```bash
+TARGET=x86_64-apple-darwin scripts/build-release.sh
+VERSION=0.7.0 TARGET=x86_64-apple-darwin scripts/package-release.sh
+```
+
+The release workflow builds Linux musl (`x86_64`, `aarch64`), macOS (`x86_64`, `aarch64`), and Windows MSVC (`x86_64`) targets. Unix artifacts are `.tar.gz` archives, Windows artifacts are `.zip` archives, and each package gets a `.sha256` file.
 
 ## License
 
